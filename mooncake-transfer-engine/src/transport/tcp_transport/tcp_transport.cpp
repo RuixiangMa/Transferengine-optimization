@@ -305,7 +305,13 @@ int TcpTransport::submitTransfer(BatchID batch_id,
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
         task.total_bytes = request.length;
-        auto slice = new Slice();
+        std::shared_ptr<Transport::Slice> slice;
+        try {
+            slice = std::make_shared<Transport::Slice>();
+        } catch (std::bad_alloc &e) {
+            LOG(ERROR) << "TcpTransport: failed to allocate memory for slice";
+            return ERR_MEMORY;
+        }
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
@@ -327,7 +333,13 @@ int TcpTransport::submitTransferTask(
         auto &request = *request_list[index];
         auto &task = *task_list[index];
         task.total_bytes = request.length;
-        auto slice = new Slice();
+        std::shared_ptr<Transport::Slice> slice;
+        try {
+            slice = std::make_shared<Transport::Slice>();
+        } catch (std::bad_alloc &e) {
+            LOG(ERROR) << "TcpTransport: failed to allocate memory for slice";
+            return ERR_MEMORY;
+        }
         slice->source_addr = (char *)request.source;
         slice->length = request.length;
         slice->opcode = request.opcode;
@@ -352,7 +364,7 @@ void TcpTransport::worker() {
     }
 }
 
-void TcpTransport::startTransfer(Slice *slice) {
+void TcpTransport::startTransfer(std::shared_ptr<Slice> slice) {
     try {
         boost::asio::ip::tcp::resolver resolver(context_->io_context);
         boost::asio::ip::tcp::socket socket(context_->io_context);

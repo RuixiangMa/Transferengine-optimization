@@ -233,16 +233,20 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
         LOG(ERROR) << "Invalid source_addr or file_path";
         return;
     }
-    Slice *slice = new Slice();
-    slice->source_addr = (char *)source_addr;
-    slice->length = slice_len;
-    slice->opcode = op;
-    slice->nvmeof.file_path = file_path;
-    slice->nvmeof.start = target_start;
-    slice->task = &task;
-    slice->status = Slice::PENDING;
-    task.total_bytes += slice->length;
-    task.slice_count += 1;
+    try {
+        std::shared_ptr<Slice> slice = std::make_shared<Slice>();
+        slice->source_addr = (char *)source_addr;
+        slice->length = slice_len;
+        slice->opcode = op;
+        slice->nvmeof.file_path = file_path;
+        slice->nvmeof.start = target_start;
+        slice->task = &task;
+        slice->status = Slice::PENDING;
+        task.total_bytes += slice->length;
+        task.slice_count += 1;
+    } catch (std::bad_alloc &e) {
+        LOG(ERROR) << "NVMeoFTransport: failed to allocate memory for slice";
+    }
 }
 
 void NVMeoFTransport::addSliceToCUFileBatch(

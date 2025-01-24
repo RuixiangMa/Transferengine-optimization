@@ -290,7 +290,6 @@ int RdmaTransport::submitTransferTask(
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                // task.slices.push_back(slice);
                 task.slice_count += 1;
                 break;
             }

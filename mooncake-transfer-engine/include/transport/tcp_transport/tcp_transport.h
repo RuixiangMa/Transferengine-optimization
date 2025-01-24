@@ -78,7 +78,7 @@ class TcpTransport : public Transport {
 
     void worker();
 
-    void startTransfer(Slice *slice);
+    void startTransfer(std::shared_ptr<Slice> slice);
 
     const char *getName() const override { return "tcp"; }
 
