@@ -41,10 +41,17 @@ struct transfer_request {
 
 typedef struct transfer_request transfer_request_t;
 
+struct notify_msg {
+    char *name;
+    char *msg;
+};
+
+typedef struct notify_msg notify_msg_t;
+
 #define STATUS_WAITING (0)
 #define STATUS_PENDING (1)
 #define STATUS_INVALID (2)
-#define STATUS_CANNELED (3)
+#define STATUS_CANCELED (3)
 #define STATUS_COMPLETED (4)
 #define STATUS_TIMEOUT (5)
 #define STATUS_FAILED (6)
@@ -91,13 +98,16 @@ typedef void *transport_t;
  * This means that the caller can free the memory pointed to by "char *"
  * parameters, after the call is completed.
  * All the C functions here follow this convention.
-*/
+ */
 
 transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        const char *local_server_name,
                                        const char *ip_or_host_name,
-                                       uint64_t rpc_port,
-                                       int auto_discover);
+                                       uint64_t rpc_port, int auto_discover);
+
+int discoverTopology(transfer_engine_t engine);
+
+int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len);
 
 transport_t installTransport(transfer_engine_t engine, const char *proto,
                              void **args);
@@ -106,7 +116,17 @@ int uninstallTransport(transfer_engine_t engine, const char *proto);
 
 segment_id_t openSegment(transfer_engine_t engine, const char *segment_name);
 
+segment_id_t openSegmentNoCache(transfer_engine_t engine,
+                                const char *segment_name);
+
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id);
+
+// Eagerly pre-connect all EFA endpoints to `segment_name`. Eliminates the
+// first-batch fi_av_insert stall (observed ~6 s for 16 local NICs × N peer
+// NICs). No-op on non-EFA installs. Idempotent. Returns 0 on success.
+int warmupEfaSegment(transfer_engine_t engine, const char *segment_name);
+
+int removeLocalSegment(transfer_engine_t engine, const char *segment_name);
 
 void destroyTransferEngine(transfer_engine_t engine);
 
@@ -126,6 +146,17 @@ batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size);
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
                    struct transfer_request *entries, size_t count);
+
+int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
+                             struct transfer_request *entries, size_t count,
+                             notify_msg_t notify_msg);
+
+notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size);
+
+int freeNotifsMsgBuf(notify_msg_t *msg, int size);
+
+int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
+                      notify_msg_t notify_msg);
 
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                       size_t task_id, struct transfer_status *status);

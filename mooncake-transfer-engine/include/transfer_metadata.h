@@ -16,7 +16,11 @@
 #define TRANSFER_METADATA
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>  // Ubuntu
+#else
+#include <json/json.h>  // CentOS
+#endif
 #include <netdb.h>
 
 #include <atomic>
@@ -34,20 +38,30 @@ namespace mooncake {
 struct MetadataStoragePlugin;
 struct HandShakePlugin;
 
+#define P2PHANDSHAKE "P2PHANDSHAKE"
+
 class TransferMetadata {
    public:
     struct DeviceDesc {
         std::string name;
         uint16_t lid;
         std::string gid;
+        std::string eid;  // for ub
     };
 
     struct BufferDesc {
         std::string name;
         uint64_t addr;
         uint64_t length;
-        std::vector<uint32_t> lkey;
-        std::vector<uint32_t> rkey;
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
+#endif
+        std::vector<uint32_t> lkey;         // for rdma
+        std::vector<uint32_t> rkey;         // for rdma
+        std::string shm_name;               // for nvlink and hip
+        uint64_t offset;                    // for cxl
+        std::vector<std::string> tseg;      // for ub/urma
+        std::vector<uint32_t> l_seg_index;  // for ub/urma
     };
 
     struct NVMeoFBufferDesc {
@@ -56,30 +70,73 @@ class TransferMetadata {
         std::unordered_map<std::string, std::string> local_path_map;
     };
 
+    struct RankInfoDesc {
+        uint64_t rankId = 0xFFFFFFFF;  // rank id, user rank
+        std::string hostIp;
+        uint64_t hostPort;
+        uint64_t deviceLogicId;
+        uint64_t devicePhyId;
+        uint64_t deviceType = 5;  // default
+        std::string deviceIp;
+        uint64_t devicePort;
+        uint64_t pid;
+        std::vector<std::string> endpoints;
+    };
+
     using SegmentID = uint64_t;
 
     struct SegmentDesc {
         std::string name;
         std::string protocol;
-        // this is for rdma
+        // this is for rdma/shm/urma
         std::vector<DeviceDesc> devices;
         Topology topology;
         std::vector<BufferDesc> buffers;
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
+        // this is for cxl.
+        std::string cxl_name;
+        uint64_t cxl_base_addr;
         // TODO : make these two a union or a std::variant
+        std::string timestamp;
+        // this is for ascend
+        RankInfoDesc rank_info;
+
+        int tcp_data_port;
+
+        void dump() const;
     };
 
     struct RpcMetaDesc {
         std::string ip_or_host_name;
         uint16_t rpc_port;
+#ifdef USE_BAREX
+        uint16_t barex_port;
+#endif
+        int sockfd;  // local cache
     };
 
     struct HandShakeDesc {
         std::string local_nic_path;
+        uint16_t local_lid = 0;
+        std::string local_gid;
         std::string peer_nic_path;
+#ifdef USE_UB
+        std::vector<uint32_t> jetty_num;  // for ub/urma
+#endif
+#ifdef USE_BAREX
+        uint16_t barex_port;
+#endif
         std::vector<uint32_t> qp_num;
         std::string reply_msg;  // on error
+#ifdef USE_EFA
+        std::string efa_addr;  // EFA endpoint address (hex encoded)
+#endif
+    };
+
+    struct NotifyDesc {
+        std::string name;
+        std::string notify_msg;
     };
 
    public:
@@ -103,7 +160,7 @@ class TransferMetadata {
 
     SegmentID getSegmentID(const std::string &segment_name);
 
-    int syncSegmentCache();
+    int syncSegmentCache(const std::string &segment_name);
 
     int removeSegmentDesc(const std::string &segment_name);
 
@@ -115,30 +172,57 @@ class TransferMetadata {
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
 
+    int removeLocalSegment(const std::string &segment_name);
+
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
     int removeRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    int getNotifies(std::vector<NotifyDesc> &notifies);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 
     using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
                                                  HandShakeDesc &local_desc)>;
     int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
-                             uint16_t listen_port);
+                             uint16_t listen_port, int sockfd);
 
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc);
 
+    int sendNotify(const std::string &peer_server_name,
+                   const NotifyDesc &local_desc, NotifyDesc &peer_desc);
+    int sendProbe(const std::string &peer_server_name);
+
+    void dumpMetadataContent(const std::string &segment_name = "",
+                             uint64_t offset = 0, uint64_t length = 0);
+
+    void dumpMetadataContentUnlocked();
+
    private:
+    int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
+    std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
+        Json::Value &segmentJSON, const std::string &segment_name);
+    int receivePeerMetadata(const Json::Value &peer_json,
+                            Json::Value &local_json);
+    int receivePeerNotify(const Json::Value &peer_json,
+                          Json::Value &local_json);
+    int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
+    std::string getFullMetadataKey(const std::string &segment_name) const;
+
+    bool p2p_handshake_mode_{false};
+    std::string common_key_prefix_;
+    std::string rpc_meta_prefix_;
     // local cache
     RWSpinlock segment_lock_;
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
 
+    RWSpinlock notify_lock_;
+    std::vector<NotifyDesc> notifys;
     RWSpinlock rpc_meta_lock_;
     std::unordered_map<std::string, RpcMetaDesc> rpc_meta_map_;
     RpcMetaDesc local_rpc_meta_;

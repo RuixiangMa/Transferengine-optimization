@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <tuple>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -50,7 +51,7 @@ Transport::TransferStatusEnum from_cufile_transfer_status(
         case CUFILE_INVALID:
             return Transport::INVALID;
         case CUFILE_CANCELED:
-            return Transport::CANNELED;
+            return Transport::CANCELED;
         case CUFILE_COMPLETE:
             return Transport::COMPLETED;
         case CUFILE_TIMEOUT:
@@ -73,8 +74,8 @@ NVMeoFTransport::BatchID NVMeoFTransport::allocateBatchID(size_t batch_size) {
     return batch_id;
 }
 
-int NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                       TransferStatus &status) {
+Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
+                                          TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     auto &task = batch_desc.task_list[task_id];
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
@@ -100,16 +101,29 @@ int NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         task.is_finished = true;
     }
     status = transfer_status;
-    return 0;
+    return Status::OK();
 }
 
-int NVMeoFTransport::submitTransfer(
+// Dummy implement for solving build issues, WIP
+Status NVMeoFTransport::submitTransferTask(
+    const std::vector<TransferTask *> &task_list) {
+    /* TBD */
+    return Status::OK();
+}
+
+Status NVMeoFTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
 
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size)
-        return -1;
+    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
+        LOG(ERROR)
+            << "NVMeoFTransport: Exceed the limitation of current batch's "
+               "capacity";
+        return Status::InvalidArgument(
+            "NVMeoFTransport: Exceed the limitation of capacity, batch id: " +
+            std::to_string(batch_id));
+    }
 
     size_t task_id = batch_desc.task_list.size();
     size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
@@ -187,19 +201,19 @@ int NVMeoFTransport::submitTransfer(
 
     desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
     // LOG(INFO) << "submit nr " << slice_id << " start " << start_slice_id;
-    return 0;
+    return Status::OK();
 }
 
-int NVMeoFTransport::freeBatchID(BatchID batch_id) {
+Status NVMeoFTransport::freeBatchID(BatchID batch_id) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
     int desc_idx = nvmeof_desc.desc_idx_;
-    int rc = Transport::freeBatchID(batch_id);
-    if (rc < 0) {
-        return -1;
+    Status rc = Transport::freeBatchID(batch_id);
+    if (rc != Status::OK()) {
+        return rc;
     }
     desc_pool_->freeCUfileDesc(desc_idx);
-    return 0;
+    return Status::OK();
 }
 
 int NVMeoFTransport::install(std::string &local_server_name,
@@ -233,7 +247,7 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
         LOG(ERROR) << "Invalid source_addr or file_path";
         return;
     }
-    Slice *slice = new Slice();
+    Slice *slice = getSliceCache().allocate();
     slice->source_addr = (char *)source_addr;
     slice->length = slice_len;
     slice->opcode = op;
@@ -241,8 +255,10 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
     slice->nvmeof.start = target_start;
     slice->task = &task;
     slice->status = Slice::PENDING;
+    slice->ts = 0;
+    task.slice_list.push_back(slice);
     task.total_bytes += slice->length;
-    task.slice_count += 1;
+    __sync_fetch_and_add(&task.slice_count, 1);
 }
 
 void NVMeoFTransport::addSliceToCUFileBatch(

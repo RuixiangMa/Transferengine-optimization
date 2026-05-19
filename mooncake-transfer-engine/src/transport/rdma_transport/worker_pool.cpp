@@ -23,10 +23,6 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif  // USE_CUDA
-
 // Experimental: Per-thread SegmentDesc & EndPoint Caches
 // #define CONFIG_CACHE_SEGMENT_DESC
 // #define CONFIG_CACHE_ENDPOINT
@@ -96,40 +92,53 @@ int WorkerPool::submitPostSend(
         if (!segment_desc_map.count(target_id))
             segment_desc_map[target_id] =
                 context_.engine().meta()->getSegmentDescByID(target_id);
-        if (!segment_desc_map[target_id]) {
-            LOG(ERROR) << "Cannot get target segment #" << target_id;
-            return ERR_INVALID_ARGUMENT;
-        }
     }
 #endif  // CONFIG_CACHE_SEGMENT_DESC
 
     SliceList slice_list_map[kShardCount];
     uint64_t submitted_slice_count = 0;
+    thread_local std::unordered_map<int, uint64_t> failed_target_ids;
     for (auto &slice : slice_list) {
+        if (failed_target_ids.count(slice->target_id)) {
+            auto ts = failed_target_ids[slice->target_id];
+            if (getCurrentTimeInNano() - ts < 100000000ull) {
+                slice->markFailed();
+                continue;
+            } else {
+                failed_target_ids.erase(slice->target_id);
+            }
+        }
         auto &peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
+        auto hint = globalConfig().enable_dest_device_affinity
+                        ? context_.deviceName()
+                        : "";
         if (RdmaTransport::selectDevice(peer_segment_desc.get(),
                                         slice->rdma.dest_addr, slice->length,
-                                        buffer_id, device_id)) {
-            LOG(WARNING) << "Reselect remote NIC for address "
-                         << (void *)slice->rdma.dest_addr << " on segment #"
-                         << slice->target_id;
+                                        hint, buffer_id, device_id)) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
-                LOG(ERROR) << "Cannot get target segment #" << slice->target_id;
-                slice->markFailed();
-                continue;
-            }
-            if (RdmaTransport::selectDevice(
-                    peer_segment_desc.get(), slice->rdma.dest_addr,
-                    slice->length, buffer_id, device_id)) {
-                LOG(ERROR) << "Failed to select remote NIC for address "
-                           << (void *)slice->rdma.dest_addr << " on segment #"
+                LOG(ERROR) << "Cannot reload target segment #"
                            << slice->target_id;
                 slice->markFailed();
+                failed_target_ids[slice->target_id] = getCurrentTimeInNano();
                 continue;
             }
+
+            if (RdmaTransport::selectDevice(
+                    peer_segment_desc.get(), slice->rdma.dest_addr,
+                    slice->length, hint, buffer_id, device_id)) {
+                slice->markFailed();
+                context_.engine().meta()->dumpMetadataContent(
+                    peer_segment_desc->name, slice->rdma.dest_addr,
+                    slice->length);
+                continue;
+            }
+        }
+        if (!peer_segment_desc) {
+            slice->markFailed();
+            continue;
         }
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
@@ -152,9 +161,11 @@ int WorkerPool::submitPostSend(
         slice_queue_lock_[shard_id].unlock();
     }
 
-    submitted_slice_count_.fetch_add(submitted_slice_count,
-                                     std::memory_order_relaxed);
-    if (suspended_flag_.load(std::memory_order_relaxed)) cond_var_.notify_all();
+    submitted_slice_count_.fetch_add(submitted_slice_count);
+    if (suspended_flag_.load()) {
+        std::lock_guard<std::mutex> lock(cond_mutex_);
+        cond_var_.notify_all();
+    }
 
     return 0;
 }
@@ -204,23 +215,6 @@ void WorkerPool::performPostSend(int thread_id) {
     for (auto &entry : local_slice_queue) {
         if (entry.second.empty()) continue;
 
-        if (entry.second[0]->target_id == LOCAL_SEGMENT_ID) {
-            for (auto &slice : entry.second) {
-                LOG_ASSERT(slice->target_id == LOCAL_SEGMENT_ID);
-#ifdef USE_CUDA
-                cudaMemcpy((void *)slice->rdma.dest_addr, slice->source_addr,
-                           slice->length, cudaMemcpyDefault);
-#else
-                memcpy((void *)slice->rdma.dest_addr, slice->source_addr,
-                       slice->length);
-#endif
-                slice->markSuccess();
-            }
-            processed_slice_count_.fetch_add(entry.second.size());
-            entry.second.clear();
-            continue;
-        }
-
 #ifdef USE_FAKE_POST_SEND
         for (auto &slice : entry.second) slice->markSuccess();
         processed_slice_count_.fetch_add(entry.second.size());
@@ -234,15 +228,31 @@ void WorkerPool::performPostSend(int thread_id) {
         auto endpoint = context_.endpoint(entry.first);
 #endif
         if (!endpoint) {
-            LOG(ERROR) << "Worker: Cannot allocate endpoint: " << entry.first;
+            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            entry.second.clear();
+            continue;
+        }
+        if (!endpoint->active()) {
+            if (endpoint->inactiveTime() > 1.0)
+                context_.deleteEndpoint(
+                    entry.first);  // enable for re-establishation
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
         }
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
             LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first;
+                       << entry.first << ", mark it inactive";
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            endpoint->set_active(false);
+            failed_nr_polls++;
+            if (context_.active() && failed_nr_polls > 32 &&
+                !success_nr_polls) {
+                LOG(WARNING)
+                    << "Failed to establish peer endpoints in local RNIC "
+                    << context_.nicPath() << ", mark it inactive";
+                context_.set_active(false);
+            }
             entry.second.clear();
             continue;
         }
@@ -278,16 +288,39 @@ void WorkerPool::performPollCq(int thread_id) {
                 qp_depth_set[slice->rdma.qp_depth] = 1;
             // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
             if (wc[i].status != IBV_WC_SUCCESS) {
+                // Flush errors are generated when QPs transition to ERR
+                // state (e.g., during two-phase endpoint destruction via
+                // beginDestroy). They are not real network errors, so we
+                // directly mark the slice as failed without retry, without
+                // counting toward the RNIC error threshold, and without
+                // triggering endpoint deletion.
+                if (wc[i].status == IBV_WC_WR_FLUSH_ERR) {
+                    if (globalConfig().trace)
+                        LOG(INFO)
+                            << "Worker: WR flush error (peer_nic: "
+                            << slice->peer_nic_path << "), marking failed";
+                    slice->markFailed();
+                    processed_slice_count++;
+                    continue;
+                }
+
                 LOG(ERROR) << "Worker: Process failed for slice (opcode: "
                            << slice->opcode
                            << ", source_addr: " << slice->source_addr
                            << ", length: " << slice->length
-                           << ", dest_addr: " << slice->rdma.dest_addr
+                           << ", dest_addr: " << (void *)slice->rdma.dest_addr
                            << ", local_nic: " << context_.deviceName()
                            << ", peer_nic: " << slice->peer_nic_path
                            << ", dest_rkey: " << slice->rdma.dest_rkey
                            << ", retry_cnt: " << slice->rdma.retry_cnt
                            << "): " << ibv_wc_status_str(wc[i].status);
+                failed_nr_polls++;
+                if (context_.active() && failed_nr_polls > 32 &&
+                    !success_nr_polls) {
+                    LOG(WARNING) << "Too many errors found in local RNIC "
+                                 << context_.nicPath() << ", mark it inactive";
+                    context_.set_active(false);
+                }
                 context_.deleteEndpoint(slice->peer_nic_path);
                 slice->rdma.retry_cnt++;
                 if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
@@ -297,12 +330,11 @@ void WorkerPool::performPollCq(int thread_id) {
                     collective_slice_queue_[thread_id][slice->peer_nic_path]
                         .push_back(slice);
                     redispatch_counter_++;
-                    // std::vector<RdmaTransport::Slice *> slice_list { slice };
-                    // redispatch(slice_list, thread_id);
                 }
             } else {
                 slice->markSuccess();
                 processed_slice_count++;
+                success_nr_polls++;
             }
         }
         if (nr_poll)
@@ -330,7 +362,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
     }
 
     for (auto &slice : slice_list) {
-        if (slice->rdma.retry_cnt == slice->rdma.max_retry_cnt) {
+        if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
             slice->markFailed();
             processed_slice_count_++;
         } else {
@@ -370,7 +402,12 @@ void WorkerPool::transferWorker(int thread_id) {
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
                 suspended_flag_.fetch_add(1);
-                cond_var_.wait_for(lock, std::chrono::seconds(1));
+                // Double-check condition after acquiring lock to avoid lost
+                // wakeup
+                if (processed_slice_count_.load(std::memory_order_relaxed) ==
+                    submitted_slice_count_.load()) {
+                    cond_var_.wait_for(lock, std::chrono::seconds(1));
+                }
                 suspended_flag_.fetch_sub(1);
                 last_wait_ts = curr_wait_ts;
             }
@@ -385,16 +422,62 @@ void WorkerPool::transferWorker(int thread_id) {
 
 int WorkerPool::doProcessContextEvents() {
     ibv_async_event event;
+    bool event_acked = false;
     if (ibv_get_async_event(context_.context(), &event) < 0) return ERR_CONTEXT;
     LOG(WARNING) << "Worker: Received context async event "
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context_.deviceName();
-    if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
-        event.event_type == IBV_EVENT_CQ_ERR ||
-        event.event_type == IBV_EVENT_WQ_FATAL ||
-        event.event_type == IBV_EVENT_PORT_ERR ||
-        event.event_type == IBV_EVENT_LID_CHANGE) {
+    if (event.event_type == IBV_EVENT_QP_FATAL) {
+        auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
+
+        /**
+         * There might be a deadlock if we call endpoint->set_active(false)
+         * before ack the event:
+         *
+         * Thread A:
+         *     Holding endpoint->lock_ and calling ibv_destroy_qp (if using
+         * eRDMA), ibv_destroy_qp will block until the event is acked.
+         *
+         * Thread B (this thread):
+         *     Calling endpoint->set_active(false), which blocks as
+         * endpoint->lock_ is held by Thread A.
+         */
+        ibv_ack_async_event(&event);
+        event_acked = true;
+
+        /**
+         * After ack the event, the endpoint might be destroyed if it happened
+         * to be destroying event.element.qp. Therefore, we cannot just
+         * dereference endpoint_ptr. Instead, we need to get the shared_ptr of
+         * the endpoint from context_ and use that shared_ptr to access the
+         * endpoint.
+         */
+        auto endpoint = context_.getEndpointByPtr(endpoint_ptr);
+        if (endpoint) {
+            endpoint->set_active(false);
+        }
+    } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
+               event.event_type == IBV_EVENT_CQ_ERR ||
+               event.event_type == IBV_EVENT_WQ_FATAL ||
+               event.event_type == IBV_EVENT_PORT_ERR ||
+               event.event_type == IBV_EVENT_LID_CHANGE) {
         context_.set_active(false);
+
+        /**
+         * Similar deadlock might happen if we call
+         * context_.disconnectAllEndpoints() before ack the event:
+         *
+         * Thread A:
+         *     Holding endpoint->lock_ and calling ibv_destroy_qp (if using
+         * eRDMA), ibv_destroy_qp will block until the event is acked.
+         *
+         * Thread B (this thread):
+         *     Calling endpoint->disconnect(), which blocks as endpoint->lock_
+         * is held by Thread A.
+         */
+        ibv_ack_async_event(&event);
+        event_acked = true;
+
         context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now inactive";
@@ -403,17 +486,33 @@ int WorkerPool::doProcessContextEvents() {
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now active";
     }
-    ibv_ack_async_event(&event);
+
+    if (!event_acked) {
+        ibv_ack_async_event(&event);
+    }
+
     return 0;
 }
 
 void WorkerPool::monitorWorker() {
     bindToSocket(numa_socket_id_);
+    auto last_reset_ts = getCurrentTimeInNano();
     while (workers_running_) {
+        auto current_ts = getCurrentTimeInNano();
+        if (current_ts - last_reset_ts > 1000000000ll) {
+            context_.set_active(true);
+            // Drain endpoint_store_->waiting_list_ even when no new
+            // insertions are happening. Without this, reclaim only runs
+            // from RdmaContext::endpoint() and the waiting list grows
+            // unboundedly under failure load. See issue #1845.
+            context_.reclaimEndpoints();
+            last_reset_ts = current_ts;
+        }
         struct epoll_event event;
         int num_events = epoll_wait(context_.eventFd(), &event, 1, 100);
         if (num_events < 0) {
-            PLOG(ERROR) << "Worker: epoll_wait()";
+            if (errno != EWOULDBLOCK && errno != EINTR)
+                PLOG(ERROR) << "Worker: epoll_wait()";
             continue;
         }
 

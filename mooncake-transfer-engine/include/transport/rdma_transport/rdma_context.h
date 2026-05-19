@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -39,10 +40,24 @@ class RdmaTransport;
 class WorkerPool;
 class EndpointStore;
 
+// Enum to represent the network state of the GID found
+enum class GidNetworkState {
+    GID_WITH_NETWORK = 0,     // Found a GID with network device (best choice)
+    GID_WITHOUT_NETWORK = 1,  // Found a GID without network device
+    GID_NOT_FOUND = 2         // No suitable GID found
+};
+
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
     ibv_cq *native;
     volatile int outstanding;
+};
+
+struct MemoryRegionMeta {
+    // mr->addr is not set to starting address for iova based mr. Therefore we
+    // track it ourselves.
+    void *addr;
+    struct ibv_mr *mr;
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
@@ -54,7 +69,7 @@ class RdmaContext {
     ~RdmaContext();
 
     int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
-                  uint8_t port = 1, int gid_index = 0, size_t max_cqe = 4096,
+                  uint8_t port = 1, int gid_index = -1, size_t max_cqe = 4096,
                   int max_endpoints = 256);
 
    private:
@@ -66,9 +81,22 @@ class RdmaContext {
 
     int unregisterMemoryRegion(void *addr);
 
+    int preTouchMemory(void *addr, size_t length);
+
     uint32_t rkey(void *addr);
 
     uint32_t lkey(void *addr);
+
+   private:
+    int registerMemoryRegionInternal(void *addr, size_t length, int access,
+                                     MemoryRegionMeta &mrMeta);
+
+    using MemoryRegionMap = std::map<uintptr_t, MemoryRegionMeta>;
+
+    MemoryRegionMap::iterator findMemoryRegionContaining(uintptr_t addr);
+
+    MemoryRegionMap::const_iterator findMemoryRegionContaining(
+        uintptr_t addr) const;
 
    public:
     bool active() const { return active_; }
@@ -79,9 +107,30 @@ class RdmaContext {
     // EndPoint Management
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
 
+    std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr);
+
     int deleteEndpoint(const std::string &peer_nic_path);
 
+    // Drain the endpoint store's waiting list. Safe to call on any thread;
+    // intended to be invoked periodically from monitorWorker so reclaim is
+    // not gated on new endpoint insertions (which can stall under failure
+    // load while evictions/deletions continue). See issue #1845.
+    void reclaimEndpoints();
+
+    // Number of endpoints awaiting reclaim. For tests and operator
+    // observability.
+    size_t waitingListSize() const;
+
+    // Test-only: push a pre-constructed endpoint into the store's
+    // waiting_list_ so the reclaim path can be exercised without standing up
+    // a real RDMA QP.
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep);
+
     int disconnectAllEndpoints();
+
+    // Get the total number of QPs across all endpoints in this context
+    size_t getTotalQPNumber() const;
 
    public:
     // Device name, such as `mlx5_3`
@@ -133,9 +182,10 @@ class RdmaContext {
 
     int joinNonblockingPollList(int event_fd, int data_fd);
 
-    int getBestGidIndex(const std::string &device_name,
-                        struct ibv_context *context, ibv_port_attr &port_attr,
-                        uint8_t port);
+    GidNetworkState findBestGidIndex(const std::string &device_name,
+                                     struct ibv_context *context,
+                                     ibv_port_attr &port_attr, uint8_t port,
+                                     int &gid_index);
 
    public:
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
@@ -146,6 +196,7 @@ class RdmaContext {
 
     ibv_context *context_ = nullptr;
     ibv_pd *pd_ = nullptr;
+    uint64_t max_mr_size;
     int event_fd_ = -1;
 
     size_t num_comp_channel_ = 0;
@@ -159,7 +210,7 @@ class RdmaContext {
     ibv_gid gid_;
 
     RWSpinlock memory_regions_lock_;
-    std::vector<ibv_mr *> memory_region_list_;
+    MemoryRegionMap memory_region_map_;
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;

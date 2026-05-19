@@ -17,13 +17,24 @@
 
 #include <glog/logging.h>
 #include <numa.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <charconv>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
+#include <iomanip>
+#include <iostream>
+#include <optional>
+#include <sstream>
+#include <string_view>
 #include <thread>
 
 #include "error.h"
@@ -31,29 +42,52 @@
 #if defined(__x86_64__)
 #include <immintrin.h>
 #define PAUSE() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define PAUSE() __asm__ __volatile__("yield")
 #else
 #define PAUSE()
 #endif
 
+#ifndef likely
 #define likely(x) __glibc_likely(x)
 #define unlikely(x) __glibc_unlikely(x)
+#endif
 
 namespace mooncake {
 const static int LOCAL_SEGMENT_ID = 0;
 
+enum class HandShakeRequestType {
+    Connection = 0,
+    Metadata = 1,
+    Notify = 2,
+    Probe = 3,
+    // placeholder for old protocol without RequestType
+    OldProtocol = 0xff,
+};
+
+static inline std::string getHostname() {
+    char hostname[256];
+    if (gethostname(hostname, 256)) {
+        PLOG(ERROR) << "Failed to get hostname";
+        return "";
+    }
+    return hostname;
+}
+
 static inline int bindToSocket(int socket_id) {
     if (unlikely(numa_available() < 0)) {
-        LOG(ERROR) << "The platform does not support NUMA";
+        LOG(WARNING) << "The platform does not support NUMA";
         return ERR_NUMA;
     }
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
-    int num_nodes = numa_num_configured_nodes();
-    if (socket_id < 0 || socket_id >= num_nodes) socket_id = 0;
+    if (socket_id < 0 || socket_id >= numa_num_configured_nodes())
+        socket_id = 0;
     struct bitmask *cpu_list = numa_allocate_cpumask();
     numa_node_to_cpus(socket_id, cpu_list);
+    int nr_possible_cpus = numa_num_possible_cpus();
     int nr_cpus = 0;
-    for (int cpu = 0; cpu < numa_num_possible_cpus(); ++cpu) {
+    for (int cpu = 0; cpu < nr_possible_cpus; ++cpu) {
         if (numa_bitmask_isbitset(cpu_list, cpu) &&
             numa_bitmask_isbitset(numa_all_cpus_ptr, cpu)) {
             CPU_SET(cpu, &cpu_set);
@@ -63,7 +97,7 @@ static inline int bindToSocket(int socket_id) {
     numa_free_cpumask(cpu_list);
     if (nr_cpus == 0) return 0;
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set)) {
-        LOG(ERROR) << "Failed to set socket affinity";
+        LOG(ERROR) << "bindToSocket: pthread_setaffinity_np failed";
         return ERR_NUMA;
     }
     return 0;
@@ -73,28 +107,206 @@ static inline int64_t getCurrentTimeInNano() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts)) {
-        PLOG(ERROR) << "Failed to read real-time lock";
+        PLOG(ERROR) << "getCurrentTimeInNano: clock_gettime failed";
         return ERR_CLOCK;
     }
     return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
 }
 
+static inline int64_t getCurrentTimeInMilli() {
+    return getCurrentTimeInNano() / 1000 / 1000;
+}
+
+static inline std::string getCurrentDateTime() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    auto local_time = *std::localtime(&time_t_now);
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                      now.time_since_epoch()) %
+                  1000000;
+    std::ostringstream oss;
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
+        << std::setw(6) << std::setfill('0') << micros.count();
+    return oss.str();
+}
+
 uint16_t getDefaultHandshakePort();
+
+template <typename T>
+std::optional<T> parseFromString(std::string_view str) {
+    T result = T();
+    auto [ptr, ec] =
+        std::from_chars(str.data(), str.data() + str.size(), result);
+    if (ec != std::errc() || ptr != str.data() + str.size()) {
+        return {};
+    }
+    return {std::move(result)};
+}
+
+static inline uint16_t getPortFromString(std::string_view port_string,
+                                         uint16_t default_port) {
+    std::optional<uint16_t> port = parseFromString<uint16_t>(port_string);
+    if (port.has_value()) {
+        return *port;
+    }
+    LOG(WARNING) << "Illegal port number in " << port_string
+                 << ". Use default port " << default_port << " instead";
+    return default_port;
+}
+
+static inline bool isValidIpV6(const std::string &address) {
+    sockaddr_in6 addr;
+    std::memset(&addr, 0, sizeof(addr));
+    // Handle IPv6 addresses with scope ID (e.g., fe80::1%eth0)
+    // inet_pton doesn't accept scope ID, so we need to strip it first
+    size_t scope_pos = address.find('%');
+    if (scope_pos == std::string::npos) {
+        // No scope ID, validate directly without string copy
+        return inet_pton(AF_INET6, address.c_str(), &addr.sin6_addr) == 1;
+    }
+
+    // Found scope ID. Check if there's a port after it (colon after %)
+    // If there's a port, this is NOT a valid pure IPv6 address
+    if (address.find(':', scope_pos) != std::string::npos) {
+        // Has port after scope ID (e.g., fe80::1%eth0:12345), not a pure IPv6
+        return false;
+    }
+
+    // No port, just strip the scope ID for validation
+    std::string addr_to_check = address.substr(0, scope_pos);
+    return inet_pton(AF_INET6, addr_to_check.c_str(), &addr.sin6_addr) == 1;
+}
+
+static inline std::string maybeWrapIpV6(const std::string &address) {
+    if (isValidIpV6(address)) {
+        return "[" + address + "]";
+    }
+    return address;
+}
+
+// Helper struct to hold IPv6 parsing result
+struct IPv6ParseResult {
+    bool matched;           // Whether the input was recognized as IPv6
+    std::string host;       // Extracted host (empty if not matched)
+    std::string_view port;  // Port string view (empty if no port found)
+};
+
+// Helper function to extract IPv6 host and port string from server_name
+// Returns: {matched, host, port_string_view}
+// - matched: true if input is IPv6 format, false otherwise
+// - host: the IPv6 address (without brackets, with scope ID if present)
+// - port: string_view of the port portion (empty if no port)
+static inline IPv6ParseResult extractIPv6HostAndPort(
+    const std::string &server_name) {
+    if (server_name.starts_with("[")) {
+        // [ipv6] or [ipv6]:port
+        const size_t closing_bracket_pos = server_name.find(']');
+        if (closing_bracket_pos != std::string::npos) {
+            std::string potentialHost =
+                server_name.substr(1, closing_bracket_pos - 1);
+            if (isValidIpV6(potentialHost)) {
+                const size_t colon_pos =
+                    server_name.find(':', closing_bracket_pos);
+                std::string_view port_str;
+                if (colon_pos != std::string::npos) {
+                    port_str =
+                        std::string_view(server_name).substr(colon_pos + 1);
+                }
+                return {true, std::move(potentialHost), port_str};
+            }
+        }
+        // Not valid ipv6, fallback to ipv4/host/etc mode
+        return {false, "", ""};
+    }
+
+    if (isValidIpV6(server_name)) {
+        // Pure IPv6 address without port
+        return {true, server_name, ""};
+    }
+
+    // Handle IPv6 with scope ID but without brackets (e.g., fe80::1%eth0:12345)
+    const size_t scope_pos = server_name.find('%');
+    if (scope_pos != std::string::npos) {
+        const size_t colon_after_scope = server_name.find(':', scope_pos);
+        if (colon_after_scope != std::string::npos) {
+            std::string host = server_name.substr(0, colon_after_scope);
+            if (isValidIpV6(host)) {
+                return {true, std::move(host),
+                        std::string_view(server_name)
+                            .substr(colon_after_scope + 1)};
+            }
+        } else {
+            // No port after scope ID, just return the address with default port
+            if (isValidIpV6(server_name)) {
+                return {true, server_name, ""};
+            }
+        }
+    }
+
+    return {false, "", ""};
+}
 
 static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
     const std::string &server_name) {
     uint16_t port = getDefaultHandshakePort();
-    auto pos = server_name.find(':');
-    if (pos == server_name.npos) return std::make_pair(server_name, port);
-    auto trimmed_server_name = server_name.substr(0, pos);
-    auto port_str = server_name.substr(pos + 1);
-    int val = std::atoi(port_str.c_str());
-    if (val <= 0 || val > 65535)
-        LOG(WARNING) << "Illegal port number in " << server_name
-                     << ". Use default port " << port << " instead";
-    else
-        port = (uint16_t)val;
-    return std::make_pair(trimmed_server_name, port);
+
+    auto result = extractIPv6HostAndPort(server_name);
+    if (result.matched) {
+        return {
+            std::move(result.host),
+            result.port.empty() ? port : getPortFromString(result.port, port)};
+    }
+
+    // non ipv6 cases:
+    const size_t colon_pos = server_name.rfind(':');
+
+    if (colon_pos == server_name.npos) {
+        return {server_name, port};
+    }
+    return {server_name.substr(0, colon_pos),
+            getPortFromString(server_name.substr(colon_pos + 1), port)};
+}
+
+static inline uint16_t parsePortAndDevice(std::string_view suffix,
+                                          uint16_t default_port,
+                                          int *device_id) {
+    auto colon_pos = suffix.find(':');
+    if (colon_pos == suffix.npos) {
+        return getPortFromString(suffix, default_port);
+    }
+    auto port_str = suffix.substr(0, colon_pos);
+    auto npu_str = suffix.substr(colon_pos + 1);
+
+    auto npu_ops = npu_str.find('_');
+    if (npu_ops != npu_str.npos && npu_ops != 0 &&
+        npu_ops != npu_str.size() - 1) {
+        *device_id =
+            parseFromString<int>(npu_str.substr(npu_ops + 1)).value_or(0);
+    }
+    return getPortFromString(port_str, default_port);
+}
+
+static inline std::pair<std::string, uint16_t> parseHostNameWithPortAscend(
+    const std::string &server_name, int *device_id) {
+    uint16_t port = getDefaultHandshakePort();
+
+    auto result = extractIPv6HostAndPort(server_name);
+    if (result.matched) {
+        return {std::move(result.host),
+                result.port.empty()
+                    ? port
+                    : parsePortAndDevice(result.port, port, device_id)};
+    }
+
+    // non ipv6 cases:
+    auto colon_pos = server_name.find(':');
+    if (colon_pos == server_name.npos) {
+        return std::make_pair(server_name, port);
+    }
+
+    return {
+        server_name.substr(0, colon_pos),
+        parsePortAndDevice(server_name.substr(colon_pos + 1), port, device_id)};
 }
 
 static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
@@ -119,9 +331,13 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
 }
 
 static inline ssize_t readFully(int fd, void *buf, size_t len) {
+    // Set a timeout for read to avoid hanging forever.
+    constexpr std::chrono::seconds kReadTimeout = std::chrono::seconds(300);
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + kReadTimeout;
     char *pos = (char *)buf;
     size_t nbytes = len;
-    while (nbytes) {
+    while (nbytes && std::chrono::steady_clock::now() < deadline) {
         ssize_t rc = read(fd, pos, nbytes);
         if (rc < 0 && (errno == EAGAIN || errno == EINTR))
             continue;
@@ -136,30 +352,104 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
         pos += rc;
         nbytes -= rc;
     }
-    return len;
+    if (nbytes != 0) {
+        LOG(WARNING) << "Socket read timed out, timeout: "
+                     << kReadTimeout.count()
+                     << ", deadline: " << deadline.time_since_epoch().count()
+                     << ", read " << len - nbytes << " out of " << len
+                     << " bytes";
+    }
+    return len - nbytes;
 }
 
-static inline int writeString(int fd, const std::string &str) {
-    uint64_t length = str.size();
+static inline int writeString(int fd, const HandShakeRequestType type,
+                              const std::string &str) {
+    uint8_t byte = static_cast<uint8_t>(type);
+    // LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
+    //           << "): " << str;
+    uint64_t length =
+        str.size() +
+        (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
     if (writeFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
         return ERR_SOCKET;
-    if (writeFully(fd, str.data(), length) != (ssize_t)length)
+    if (type != HandShakeRequestType::OldProtocol) {
+        if (writeFully(fd, &byte, sizeof(byte)) != (ssize_t)sizeof(byte))
+            return ERR_SOCKET;
+    }
+    if (writeFully(fd, str.data(), str.size()) != (ssize_t)str.size())
         return ERR_SOCKET;
     return 0;
 }
 
-static inline std::string readString(int fd) {
-    const static size_t kMaxLength = 1ull << 20;
+// Constants for handshake max length configuration
+constexpr size_t kDefaultHandshakeMaxLength = 1ULL << 20;  // 1MB (also minimum)
+constexpr size_t kMaxHandshakeMaxLength = 128ULL << 20;    // 128MB
+
+// Load handshake max length from environment variable.
+static inline size_t loadHandshakeMaxLength() {
+    const char *env = std::getenv("MC_HANDSHAKE_MAX_LENGTH");
+    if (env != nullptr) {
+        std::string_view env_sv(env);
+        size_t val = 0;
+        auto [ptr, ec] =
+            std::from_chars(env_sv.data(), env_sv.data() + env_sv.size(), val);
+        if (ec == std::errc() && ptr == env_sv.data() + env_sv.size() &&
+            val >= kDefaultHandshakeMaxLength &&
+            val <= kMaxHandshakeMaxLength) {
+            LOG(INFO) << "MC_HANDSHAKE_MAX_LENGTH set to " << val << " bytes ("
+                      << (val >> 20) << " MB)";
+            return val;
+        }
+        LOG(WARNING) << "Invalid MC_HANDSHAKE_MAX_LENGTH value: " << env
+                     << ", valid range: " << kDefaultHandshakeMaxLength
+                     << " to " << kMaxHandshakeMaxLength << ", using default "
+                     << (kDefaultHandshakeMaxLength >> 20) << "MB";
+    }
+    return kDefaultHandshakeMaxLength;
+}
+
+// Get the maximum handshake message length.
+// Loaded once from MC_HANDSHAKE_MAX_LENGTH environment variable at first call.
+static inline size_t getHandshakeMaxLength() {
+    static size_t max_length = loadHandshakeMaxLength();
+    return max_length;
+}
+
+static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
+    HandShakeRequestType type = HandShakeRequestType::Connection;
+
+    const size_t kMaxLength = getHandshakeMaxLength();
     uint64_t length = 0;
-    if (readFully(fd, &length, sizeof(length)) != (ssize_t)sizeof(length))
-        return "";
-    if (length > kMaxLength) return "";
+    ssize_t n = readFully(fd, &length, sizeof(length));
+    if (n != (ssize_t)sizeof(length)) {
+        LOG(ERROR) << "readString: failed to read length, got: " << n;
+        return {type, ""};
+    }
+
+    if (length > kMaxLength) {
+        LOG(ERROR) << "readString: too large length from socket: " << length;
+        return {type, ""};
+    }
+
     std::string str;
     std::vector<char> buffer(length);
-    if (readFully(fd, buffer.data(), length) != (ssize_t)length) return "";
+    n = readFully(fd, buffer.data(), length);
+    if (n != (ssize_t)length) {
+        LOG(ERROR) << "readString: unexpected length, got: " << n
+                   << ", expected: " << length;
+        return {type, ""};
+    }
 
-    str.assign(buffer.data(), length);
-    return str;
+    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Probe)) {
+        type = static_cast<HandShakeRequestType>(buffer[0]);
+        str.assign(buffer.data() + sizeof(char), length - sizeof(char));
+    } else {
+        type = HandShakeRequestType::OldProtocol;
+        // Old protocol, no type
+        str.assign(buffer.data(), length);
+    }
+
+    return {type, str};
 }
 
 const static std::string NIC_PATH_DELIM = "@";
@@ -179,6 +469,21 @@ static inline const std::string getNicNameFromNicPath(
 
 static inline const std::string MakeNicPath(const std::string &server_name,
                                             const std::string &nic_name) {
+    return server_name + NIC_PATH_DELIM + nic_name;
+}
+
+// Strip the port from a nic_path to get a stable key for endpoint reuse.
+// "ip-172-31-45-191:15365@rdmap135s0" → "ip-172-31-45-191@rdmap135s0"
+// This allows the same physical peer to reuse endpoints across reconnections
+// (each run picks a random P2P handshake port).
+static inline std::string normalizeNicPath(const std::string &nic_path) {
+    std::string server_name = getServerNameFromNicPath(nic_path);
+    std::string nic_name = getNicNameFromNicPath(nic_path);
+    if (server_name.empty() || nic_name.empty()) return nic_path;
+    size_t colon = server_name.rfind(':');
+    if (colon != std::string::npos) {
+        server_name = server_name.substr(0, colon);
+    }
     return server_name + NIC_PATH_DELIM + nic_name;
 }
 

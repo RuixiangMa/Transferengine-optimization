@@ -15,108 +15,169 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
-#include <asm-generic/errno-base.h>
-#include <bits/stdint-uintn.h>
-#include <limits.h>
-#include <string.h>
-
-#include <cstddef>
-#include <cstdint>
-#include <map>
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
-
+#include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+class TransferEngineImpl;
+namespace tent {
+class TransferEngine;
+};
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
 using SegmentHandle = Transport::SegmentHandle;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
+const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
+
+enum class PeerLiveness : uint8_t {
+    Alive = 0,
+    Unreachable = 1,
+};
 
 class TransferEngine {
    public:
-    TransferEngine(bool auto_discover = true)
-        : metadata_(nullptr),
-          local_topology_(std::make_shared<Topology>()),
-          auto_discover_(auto_discover) {}
+#ifdef ENABLE_MULTI_PROTOCOL
+    struct RegisteredBuffer {
+        void* addr;
+        size_t length;
+        std::string location;
+        bool remote_accessible;
+        bool update_metadata;
 
-    ~TransferEngine() { freeEngine(); }
+        RegisteredBuffer(void* addr, size_t length = 0,
+                         std::string location = kWildcardLocation,
+                         bool remote_accessible = true,
+                         bool update_metadata = true)
+            : addr(addr),
+              length(length),
+              location(location),
+              remote_accessible(remote_accessible),
+              update_metadata(update_metadata) {}
+    };
+#endif
 
-    int init(const std::string &metadata_conn_string,
-             const std::string &local_server_name,
-             const std::string &ip_or_host_name, uint64_t rpc_port = 12345);
+    TransferEngine(bool auto_discover = false);
+
+    TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
+
+    ~TransferEngine();
+
+    int init(const std::string& metadata_conn_string,
+             const std::string& local_server_name,
+             const std::string& ip_or_host_name = "",
+             uint64_t rpc_port = 12345);
 
     int freeEngine();
 
-    // Only for testing.
-    Transport *installTransport(const std::string &proto, void **args);
+    Transport* installTransport(const std::string& proto, void** args);
 
-    int uninstallTransport(const std::string &proto);
+    int uninstallTransport(const std::string& proto);
 
-    SegmentHandle openSegment(const std::string &segment_name);
+    std::string getLocalIpAndPort();
+
+    int getRpcPort();
+
+    SegmentHandle openSegment(const std::string& segment_name);
+
+    Status CheckSegmentStatus(SegmentID sid);
 
     int closeSegment(SegmentHandle handle);
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location,
+    int removeLocalSegment(const std::string& segment_name);
+
+    int registerLocalMemory(void* addr, size_t length,
+                            const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = true);
+    int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
-                                 const std::string &location);
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest>& entries);
 
-    int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
+    Status submitTransferWithNotify(BatchID batch_id,
+                                    const std::vector<TransferRequest>& entries,
+                                    TransferMetadata::NotifyDesc notify_msg);
 
-    BatchID allocateBatchID(size_t batch_size) {
-        return multi_transports_->allocateBatchID(batch_size);
-    }
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol API
+    // Supports registering memory for multiple protocols (CXL, TCP / RDMA)
+    int mp_registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
 
-    int freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
-    }
+    int mp_unregisterLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
 
-    int submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) {
-        return multi_transports_->submitTransfer(batch_id, entries);
-    }
+    Status mp_submitTransfer(BatchID batch_id,
+                             const std::vector<TransferRequest>& entries,
+                             std::string& proto);
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) {
-        return multi_transports_->getTransferStatus(batch_id, task_id, status);
-    }
+    Status mp_submitTransferWithNotify(
+        BatchID batch_id, const std::vector<TransferRequest>& entries,
+        TransferMetadata::NotifyDesc notify_msg, std::string& proto);
+#endif
 
-    int syncSegmentCache() { return metadata_->syncSegmentCache(); }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
+                                 const std::string& location);
 
-    std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
+    int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
 
-    bool checkOverlap(void *addr, uint64_t length);
+    BatchID allocateBatchID(size_t batch_size);
+
+    Status freeBatchID(BatchID batch_id);
+
+    int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
+
+    int sendNotifyByID(SegmentID target_id,
+                       TransferMetadata::NotifyDesc notify_msg);
+
+    int sendNotifyByName(std::string remote_agent,
+                         TransferMetadata::NotifyDesc notify_msg);
+
+    PeerLiveness probePeerAliveByID(SegmentID target_id);
+
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus& status);
+
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
+
+    Transport* getTransport(const std::string& proto);
+
+    /**
+     * @brief Check if TCP is the only installed transport.
+     *
+     * When only TCP transport is available (no RDMA, NVLink, etc.),
+     * local memcpy is preferred over TCP loopback for same-host transfers.
+     */
+    bool isTcpOnly() const;
+
+    int syncSegmentCache(const std::string& segment_name = "");
+
+    std::shared_ptr<TransferMetadata> getMetadata();
+
+    bool checkOverlap(void* addr, uint64_t length);
+
+    void setAutoDiscover(bool auto_discover);
+
+    void* getBaseAddr();
+
+    void setWhitelistFilters(std::vector<std::string>&& filters);
+
+    int numContexts() const;
+
+    std::shared_ptr<Topology> getLocalTopology();
 
    private:
-    struct MemoryRegion {
-        void *addr;
-        uint64_t length;
-        std::string location;
-        bool remote_accessible;
-    };
-
-    std::shared_ptr<TransferMetadata> metadata_;
-    std::string local_server_name_;
-    std::shared_ptr<MultiTransport> multi_transports_;
-    std::vector<MemoryRegion> local_memory_regions_;
-    std::shared_ptr<Topology> local_topology_;
-    // Discover topology and install transports automatically when it's true.
-    // Set it to false only for testing.
-    bool auto_discover_;
+    std::shared_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    bool use_tent_{false};
 };
 }  // namespace mooncake
 

@@ -19,14 +19,16 @@
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_transport.h"
+#endif
 
 using namespace mooncake;
 
 transfer_engine_t createTransferEngine(const char *metadata_conn_string,
                                        const char *local_server_name,
                                        const char *ip_or_host_name,
-                                       uint64_t rpc_port,
-                                       int auto_discover) {
+                                       uint64_t rpc_port, int auto_discover) {
     TransferEngine *native = new TransferEngine(auto_discover);
     int ret = native->init(metadata_conn_string, local_server_name,
                            ip_or_host_name, rpc_port);
@@ -35,6 +37,18 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
         return nullptr;
     }
     return (transfer_engine_t)native;
+}
+
+int discoverTopology(transfer_engine_t engine) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return native->getLocalTopology()->discover({});
+}
+
+int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len) {
+    TransferEngine *native = (TransferEngine *)engine;
+    auto str = native->getLocalIpAndPort();
+    snprintf(buf_out, buf_len, "%s", str.c_str());
+    return 0;
 }
 
 transport_t installTransport(transfer_engine_t engine, const char *proto,
@@ -58,9 +72,37 @@ segment_id_t openSegment(transfer_engine_t engine, const char *segment_name) {
     return native->openSegment(segment_name);
 }
 
+segment_id_t openSegmentNoCache(transfer_engine_t engine,
+                                const char *segment_name) {
+    TransferEngine *native = (TransferEngine *)engine;
+    int rc = native->syncSegmentCache(segment_name);
+    if (rc) return rc;
+    return native->openSegment(segment_name);
+}
+
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->closeSegment(segment_id);
+}
+
+int warmupEfaSegment(transfer_engine_t engine, const char *segment_name) {
+#ifdef USE_EFA
+    TransferEngine *native = (TransferEngine *)engine;
+    auto *t = native->getTransport("efa");
+    if (!t) return 0;  // Non-EFA build or EFA not installed; nothing to do.
+    auto *efa = dynamic_cast<EfaTransport *>(t);
+    if (!efa) return 0;
+    return efa->warmupSegment(segment_name ? segment_name : "");
+#else
+    (void)engine;
+    (void)segment_name;
+    return 0;
+#endif
+}
+
+int removeLocalSegment(transfer_engine_t engine, const char *segment_name) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return native->removeLocalSegment(segment_name);
 }
 
 int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
@@ -116,25 +158,90 @@ int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
         native_entries[index].target_offset = entries[index].target_offset;
         native_entries[index].length = entries[index].length;
     }
-    return native->submitTransfer((Transport::BatchID)batch_id, native_entries);
+    Status s =
+        native->submitTransfer((Transport::BatchID)batch_id, native_entries);
+    return (int)s.code();
+}
+
+int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
+                             struct transfer_request *entries, size_t count,
+                             notify_msg_t notify_msg) {
+    TransferEngine *native = (TransferEngine *)engine;
+    std::vector<Transport::TransferRequest> native_entries;
+    native_entries.resize(count);
+    for (size_t index = 0; index < count; index++) {
+        native_entries[index].opcode =
+            (Transport::TransferRequest::OpCode)entries[index].opcode;
+        native_entries[index].source = entries[index].source;
+        native_entries[index].target_id = entries[index].target_id;
+        native_entries[index].target_offset = entries[index].target_offset;
+        native_entries[index].length = entries[index].length;
+    }
+    TransferMetadata::NotifyDesc native_notify_msg;
+    native_notify_msg.name = notify_msg.name;
+    native_notify_msg.notify_msg = notify_msg.msg;
+    Status s = native->submitTransferWithNotify(
+        (Transport::BatchID)batch_id, native_entries, native_notify_msg);
+    return (int)s.code();
 }
 
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                       size_t task_id, struct transfer_status *status) {
     TransferEngine *native = (TransferEngine *)engine;
     Transport::TransferStatus native_status;
-    int rc = native->getTransferStatus((Transport::BatchID)batch_id, task_id,
-                                       native_status);
-    if (rc == 0) {
+    Status s = native->getTransferStatus((Transport::BatchID)batch_id, task_id,
+                                         native_status);
+    if (s.ok()) {
         status->status = (int)native_status.s;
         status->transferred_bytes = native_status.transferred_bytes;
     }
-    return rc;
+    return (int)s.code();
+}
+
+notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
+    TransferEngine *native = (TransferEngine *)engine;
+    std::vector<TransferMetadata::NotifyDesc> notifies_desc;
+    native->getNotifies(notifies_desc);
+    *size = notifies_desc.size();
+    notify_msg_t *notifies =
+        (notify_msg_t *)malloc(*size * sizeof(notify_msg_t));
+    memset(notifies, 0, *size * sizeof(notify_msg_t));
+    for (int i = 0; i < *size; i++) {
+        notifies[i].name = (char *)malloc(notifies_desc[i].name.size() + 1);
+        notifies[i].msg =
+            (char *)malloc(notifies_desc[i].notify_msg.size() + 1);
+        if (!notifies[i].name || !notifies[i].msg) {
+            freeNotifsMsgBuf(notifies, *size);
+            return nullptr;
+        }
+        strcpy(notifies[i].name, notifies_desc[i].name.c_str());
+        strcpy(notifies[i].msg, notifies_desc[i].notify_msg.c_str());
+    }
+    return notifies;
+}
+
+int freeNotifsMsgBuf(notify_msg_t *msg, int size) {
+    for (int i = 0; i < size; i++) {
+        if (msg[i].name) free(msg[i].name);
+        if (msg[i].msg) free(msg[i].msg);
+    }
+    free(msg);
+    return 0;
+}
+
+int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
+                      notify_msg_t notify_msg) {
+    TransferEngine *native = (TransferEngine *)engine;
+    TransferMetadata::NotifyDesc notify;
+    notify.name.assign(notify_msg.name);
+    notify.notify_msg.assign(notify_msg.msg);
+    return native->sendNotifyByID(target_id, notify);
 }
 
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->freeBatchID(batch_id);
+    Status s = native->freeBatchID(batch_id);
+    return (int)s.code();
 }
 
 int syncSegmentCache(transfer_engine_t engine) {

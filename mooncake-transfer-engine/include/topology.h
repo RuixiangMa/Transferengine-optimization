@@ -16,7 +16,11 @@
 #define TOPOLOGY_H
 
 #include <glog/logging.h>
-#include <jsoncpp/json/json.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>  // Ubuntu
+#else
+#include <json/json.h>  // CentOS
+#endif
 #include <netdb.h>
 
 #include <atomic>
@@ -64,7 +68,12 @@ class Topology {
 
     void clear();
 
-    int discover();
+    int discover() {
+        std::vector<std::string> filter;
+        return discover(filter);
+    }
+
+    int discover(const std::vector<std::string> &filter);
 
     int parse(const std::string &topology_json);
 
@@ -75,6 +84,8 @@ class Topology {
     Json::Value toJson() const;
 
     int selectDevice(const std::string storage_type, int retry_count = 0);
+    int selectDevice(const std::string storage_type, std::string_view hint,
+                     int retry_count = 0);
 
     TopologyMatrix getMatrix() const { return matrix_; }
 
@@ -86,10 +97,27 @@ class Topology {
    private:
     TopologyMatrix matrix_;
     std::vector<std::string> hca_list_;
+    bool use_round_robin_;
 
     struct ResolvedTopologyEntry {
         std::vector<int> preferred_hca;
         std::vector<int> avail_hca;
+        // Maps for efficient name-to-index lookup
+        std::unordered_map<std::string, int> preferred_hca_name_to_index_map_;
+        std::unordered_map<std::string, int> avail_hca_name_to_index_map_;
+
+        // Helper method for efficient name-to-index lookup
+        int getHcaIndex(const std::string &hca_name) const {
+            // First try to find in preferred HCA map
+            auto it = preferred_hca_name_to_index_map_.find(hca_name);
+            if (it != preferred_hca_name_to_index_map_.end()) {
+                return it->second;
+            }
+
+            // Then try to find in available HCA map
+            it = avail_hca_name_to_index_map_.find(hca_name);
+            return (it != avail_hca_name_to_index_map_.end()) ? it->second : -1;
+        }
     };
     std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>
         resolved_matrix_;

@@ -22,7 +22,8 @@ Use a prefixed PR title to indicate the type of changes. Please use one of the f
 - ``[CI/Build]`` for build or continuous integration improvements.
 - ``[Doc]`` for documentation fixes and improvements.
 - ``[Integration]`` for changes in the ``mooncake-integration``.
-- ``[P2PStore]`` for changes in the ``mooncake-tp2p-store``.
+- ``[P2PStore]`` for changes in the ``mooncake-p2p-store``.
+- ``[Store]`` for changes in the ``mooncake-store``.
 - ``[TransferEngine]`` for changes in the ``mooncake-transfer-engine``.
 - ``[Misc]`` for PRs that do not fit the above categories. Please use this
   sparingly.
@@ -31,13 +32,62 @@ Use a prefixed PR title to indicate the type of changes. Please use one of the f
 
 For major architectural changes (>500 LOC excluding tests), we would expect a GitHub issue (RFC) discussing the technical design and justification.
 
+
+### Development Workflow & Pre-commit Hooks
+
+Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent formatting and lightweight static checks across Python, C++ and CMake sources.
+
+#### Included Hooks
+| Type | Tool | Purpose |
+|------|------|---------|
+| Generic | trailing-whitespace / end-of-file-fixer | Basic hygiene |
+| Project | `./scripts/code_format.sh` | Enforce Mooncake C/C++ formatting script before commit |
+| Python | ruff / ruff-format | Lint + format (includes import sorting) |
+| Spelling | codespell | Catch common typos (ignores domain-specific words) |
+| C/C++ | clang-format | Apply style from the repository's `.clang-format` |
+| CMake | cmake-format | Keep build scripts readable |
+| Meta | check-yaml / check-merge-conflict / check-added-large-files | Prevent bad commits |
+
+#### Setup
+```bash
+pip install -r requirements-dev.txt
+pre-commit install
+```
+
+After installation, every commit will run `./scripts/code_format.sh` automatically. If it rewrites files, re-stage the changes and commit again.
+
+#### Usage
+Run on all files (first run will install hook environments):
+```bash
+pre-commit run --all-files
+```
+Update hook versions occasionally:
+```bash
+pre-commit autoupdate
+git add .pre-commit-config.yaml
+git commit -m "chore: pre-commit autoupdate"
+```
+
+If clang-format is missing, install it (Ubuntu example):
+```bash
+sudo apt-get update && sudo apt-get install -y clang-format
+```
+
+You can temporarily skip hooks:
+```bash
+git commit -m "wip: skipping hooks" --no-verify
+```
+But please avoid using `--no-verify` for routine commits to keep code quality high.
+
+#### CI Integration
+The configuration supports automatic fixing PRs via `pre-commit.ci` if enabled. To activate, add the repository in the pre-commit.ci dashboard; no further changes are needed.
+
+
 ## Code Quality
 
 The PR needs to meet the following code quality standards:
 
-- We adhere to `Google Python style guide
-  <https://google.github.io/styleguide/pyguide.html>`_ and `Google C++ style guide
-  <https://google.github.io/styleguide/cppguide.html>`_.
+- We adhere to [Google Python style guide](https://google.github.io/styleguide/pyguide.html) and [Google C++ style guide](https://google.github.io/styleguide/cppguide.html).
 - The code needs to be well-documented to ensure future contributors can easily understand the code.
 - Include sufficient tests to ensure the project stays correct and robust. This includes both unit tests and integration tests.
 - Please add documentation to ``doc/`` if the PR modifies the user-facing behaviors of Mooncake. It helps Mooncake users understand and utilize the new features or changes.

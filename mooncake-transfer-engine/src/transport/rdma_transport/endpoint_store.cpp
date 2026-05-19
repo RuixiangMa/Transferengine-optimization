@@ -28,15 +28,26 @@
 
 namespace mooncake {
 std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpoint(
-    std::string peer_nic_path) {
+    const std::string &peer_nic_path) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
     if (iter != endpoint_map_.end()) return iter->second;
     return nullptr;
 }
 
+std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        if (kv.second.get() == endpoint_ptr) return kv.second;
+    }
+    for (auto &endpoint : waiting_list_)
+        if (endpoint.get() == endpoint_ptr) return endpoint;
+    return nullptr;
+}
+
 std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
-    std::string peer_nic_path, RdmaContext *context) {
+    const std::string &peer_nic_path, RdmaContext *context) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     if (endpoint_map_.find(peer_nic_path) != endpoint_map_.end()) {
         LOG(INFO) << "Endpoint " << peer_nic_path
@@ -64,12 +75,17 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
     return endpoint;
 }
 
-int FIFOEndpointStore::deleteEndpoint(std::string peer_nic_path) {
+int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
+    // Begin two-phase destruction: mark endpoint as destroying and move QPs
+    // to ERR state so inflight WRs are flushed to CQ. The endpoint is moved
+    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() once
+    // all outstanding WRs have been drained.
     if (iter != endpoint_map_.end()) {
+        waiting_list_len_++;
+        iter->second->beginDestroy();
         waiting_list_.insert(iter->second);
-        iter->second->set_active(false);
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[peer_nic_path];
         fifo_list_.erase(fifo_iter);
@@ -84,17 +100,23 @@ void FIFOEndpointStore::evictEndpoint() {
     fifo_list_.pop_front();
     fifo_map_.erase(victim);
     LOG(INFO) << victim << " evicted";
-    waiting_list_.insert(endpoint_map_[victim]);
+    waiting_list_len_++;
+    auto victim_endpoint = endpoint_map_[victim];
+    victim_endpoint->beginDestroy();
+    waiting_list_.insert(victim_endpoint);
     endpoint_map_.erase(victim);
     return;
 }
 
 void FIFOEndpointStore::reclaimEndpoint() {
+    if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
-    for (auto &endpoint : waiting_list_)
-        if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->finishDestroy()) to_delete.push_back(endpoint);
+    }
     for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
+    waiting_list_len_ -= to_delete.size();
 }
 
 size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
@@ -113,8 +135,24 @@ int FIFOEndpointStore::disconnectQPs() {
     return 0;
 }
 
+size_t FIFOEndpointStore::getTotalQPNumber() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    size_t total_qps = 0;
+    for (const auto &kv : endpoint_map_) {
+        total_qps += kv.second->getQPNumber();
+    }
+    return total_qps;
+}
+
+void FIFOEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(ep);
+    waiting_list_len_++;
+}
+
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
-    std::string peer_nic_path) {
+    const std::string &peer_nic_path) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
     if (iter != endpoint_map_.end()) {
@@ -128,8 +166,19 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
     return nullptr;
 }
 
+std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        if (kv.second.first.get() == endpoint_ptr) return kv.second.first;
+    }
+    for (auto &endpoint : waiting_list_)
+        if (endpoint.get() == endpoint_ptr) return endpoint;
+    return nullptr;
+}
+
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
-    std::string peer_nic_path, RdmaContext *context) {
+    const std::string &peer_nic_path, RdmaContext *context) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     if (endpoint_map_.find(peer_nic_path) != endpoint_map_.end()) {
         LOG(INFO) << "Endpoint " << peer_nic_path
@@ -150,18 +199,22 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
     while (this->getSize() >= max_size_) evictEndpoint();
 
     endpoint->setPeerNicPath(peer_nic_path);
-    endpoint_map_[peer_nic_path] = std::make_pair(endpoint, false);
+    endpoint_map_[peer_nic_path] = std::make_pair(endpoint, true);
     fifo_list_.push_front(peer_nic_path);
     fifo_map_[peer_nic_path] = fifo_list_.begin();
     return endpoint;
 }
 
-int SIEVEEndpointStore::deleteEndpoint(std::string peer_nic_path) {
+int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
+    // Begin two-phase destruction: mark endpoint as destroying and move QPs
+    // to ERR state so inflight WRs are flushed to CQ. The endpoint is moved
+    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() once
+    // all outstanding WRs have been drained.
     if (iter != endpoint_map_.end()) {
+        iter->second.first->beginDestroy();
         waiting_list_len_++;
-        iter->second.first->set_active(false);
         waiting_list_.insert(iter->second.first);
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[peer_nic_path];
@@ -191,12 +244,12 @@ void SIEVEEndpointStore::evictEndpoint() {
             break;
         }
     }
-    hand_ = (o == fifo_list_.begin() ? --fifo_list_.end() : std::prev(o));
+    o == fifo_list_.begin() ? hand_ = std::nullopt : hand_ = std::prev(o);
     fifo_list_.erase(o);
     fifo_map_.erase(victim);
     LOG(INFO) << victim << " evicted";
     auto victim_instance = endpoint_map_[victim].first;
-    victim_instance->set_active(false);
+    victim_instance->beginDestroy();
     waiting_list_len_++;
     waiting_list_.insert(victim_instance);
     endpoint_map_.erase(victim);
@@ -207,8 +260,9 @@ void SIEVEEndpointStore::reclaimEndpoint() {
     if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
-    for (auto &endpoint : waiting_list_)
-        if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->finishDestroy()) to_delete.push_back(endpoint);
+    }
     for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
     waiting_list_len_ -= to_delete.size();
 }
@@ -226,4 +280,29 @@ int SIEVEEndpointStore::disconnectQPs() {
 }
 
 size_t SIEVEEndpointStore::getSize() { return endpoint_map_.size(); }
+
+void SIEVEEndpointStore::testOnlyInsertWaiting(
+    std::shared_ptr<RdmaEndPoint> ep) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(ep);
+    waiting_list_len_++;
+}
+
+size_t SIEVEEndpointStore::getTotalQPNumber() {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    size_t total_qps = 0;
+
+    // Count QPs in active endpoints
+    for (const auto &kv : endpoint_map_) {
+        total_qps += kv.second.first->getQPNumber();
+    }
+
+    // Count QPs in waiting list
+    for (const auto &endpoint : waiting_list_) {
+        total_qps += endpoint->getQPNumber();
+    }
+
+    return total_qps;
+}
+
 }  // namespace mooncake

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TRANSFER_ENGINE
-#define TRANSFER_ENGINE
+#ifndef RDMA_TRANSPORT_H_
+#define RDMA_TRANSPORT_H_
 
 #include <infiniband/verbs.h>
 
@@ -71,25 +71,37 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
+   private:
+    // Internal version with force_sequential option to avoid nested parallelism
+    int registerLocalMemoryInternal(void *addr, size_t length,
+                                    const std::string &location,
+                                    bool remote_accessible,
+                                    bool update_metadata,
+                                    bool force_sequential);
+
+    int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
+                                      bool force_sequential);
+
+   public:
     // TRANSFER
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest> &entries) override;
 
-    int submitTransfer(BatchID batch_id,
-                       const std::vector<TransferRequest> &entries) override;
-
-    int submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
+    Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
-    int getTransferStatus(BatchID batch_id,
-                          std::vector<TransferStatus> &status);
+    Status getTransferStatus(BatchID batch_id,
+                             std::vector<TransferStatus> &status);
 
-    int getTransferStatus(BatchID batch_id, size_t task_id,
-                          TransferStatus &status) override;
+    Status getTransferStatus(BatchID batch_id, size_t task_id,
+                             TransferStatus &status) override;
 
     SegmentID getSegmentID(const std::string &segment_name);
 
    private:
     int allocateLocalSegmentID();
+
+    int preTouchMemory(void *addr, size_t length);
 
    public:
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
@@ -110,10 +122,12 @@ class RdmaTransport : public Transport {
    public:
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             int &buffer_id, int &device_id, int retry_cnt = 0);
+    static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
+                            std::string_view hint, int &buffer_id,
+                            int &device_id, int retry_cnt = 0);
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
-    std::atomic<SegmentID> next_segment_id_;
     std::shared_ptr<Topology> local_topology_;
 };
 
@@ -125,4 +139,4 @@ using BatchID = Transport::BatchID;
 
 }  // namespace mooncake
 
-#endif  // TRANSFER_ENGINE
+#endif  // RDMA_TRANSPORT_H_

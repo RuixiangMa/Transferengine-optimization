@@ -75,12 +75,14 @@ TEST_F(TransferMetadataTest, LocalSegmentTest) {
     ASSERT_EQ(des, segment_des);
     auto id = metadata_client->getSegmentID(segment_name);
     ASSERT_EQ(id, segment_id);
+    re = metadata_client->removeLocalSegment(segment_name);
+    ASSERT_EQ(re, 0);
 }
 
 // add and remove LocalMemoryBufferMeta
 TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();
-    segment_des->name = "test_localMemery";
+    segment_des->name = "test_localMemory";
     segment_des->protocol = "rdma";
     int re = metadata_client->addLocalSegment(
         LOCAL_SEGMENT_ID, "test_local_segment", std::move(segment_des));
@@ -101,6 +103,8 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
         re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
         ASSERT_EQ(re, 0);
     }
+    re = metadata_client->removeLocalSegment("test_local_segment");
+    ASSERT_EQ(re, 0);
 }
 
 // add, get and remove RPCMetaEntryMeta

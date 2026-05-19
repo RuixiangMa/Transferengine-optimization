@@ -5,6 +5,7 @@ build_ofed4
 old
 local_test
 go.sum
+!mooncake-common/etcd/go.sum
 *.so
 bin
 mod
@@ -175,4 +176,33 @@ cython_debug/
 
 *.etcd
 
+# Ignore generated protobuf files
+*.pb.cc
+*.pb.cpp
+*.pb.h
+
 thirdparties
+
+# JetBrains IDEs
+.idea
+cmake-build-debug
+cmake-build-release
+cmake-build-relwithdebinfo
+cmake-build-minsizerel
+cmake-build
+
+libetcd_wrapper.h
+
+mooncake-wheel/mooncake/allocator.py
+mooncake-wheel/mooncake/allocator_ascend_npu.py
+mooncake-wheel/mooncake/mooncake_master
+mooncake-wheel/mooncake/transfer_engine_bench
+
+# Claude Code Memory
+CLAUDE.md
+
+# CodeQL
+_codeql_detected_source_root
+
+# CodeBuddy Memory
+.codebuddy/

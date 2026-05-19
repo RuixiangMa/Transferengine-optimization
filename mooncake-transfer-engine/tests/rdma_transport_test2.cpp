@@ -24,19 +24,11 @@
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "common.h"
 
 using namespace mooncake;
 
 namespace mooncake {
-
-static std::string getHostname() {
-    char hostname[256];
-    if (gethostname(hostname, 256)) {
-        PLOG(ERROR) << "Failed to get hostname";
-        return "";
-    }
-    return hostname;
-}
 
 DEFINE_string(local_server_name, getHostname(),
               "Local server name for segment discovery");
@@ -90,7 +82,13 @@ std::string loadNicPriorityMatrix() {
            " \"cpu:1\": [[" +
            device_names +
            "], []], "
-           " \"gpu:0\": [[" +
+           " \"cuda:0\": [[" +
+           device_names +
+           "], []], "
+           " \"musa:0\": [[" +
+           device_names +
+           "], []], "
+           " \"maca:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -157,20 +155,20 @@ TEST_F(RDMATransportTest, MultiWrite) {
         for (size_t offset = 0; offset < kDataLength; ++offset)
             *((char *)(addr) + offset) = 'a' + lrand48() % 26;
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
         entry.length = kDataLength;
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            ASSERT_EQ(ret, 0);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
             else if (status.s == TransferStatusEnum::FAILED) {
@@ -178,8 +176,8 @@ TEST_F(RDMATransportTest, MultiWrite) {
                 completed = true;
             }
         }
-        ret = engine->freeBatchID(batch_id);
-        ASSERT_EQ(ret, 0);
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
     }
 }
 
@@ -191,20 +189,20 @@ TEST_F(RDMATransportTest, MultipleRead) {
             *((char *)(addr) + offset) = 'a' + lrand48() % 26;
 
         auto batch_id = engine->allocateBatchID(1);
-        int ret = 0;
+        Status s;
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
         entry.length = kDataLength;
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        LOG_ASSERT(!ret);
+        s = engine->submitTransfer(batch_id, {entry});
+        LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            ASSERT_EQ(ret, 0);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
             else if (status.s == TransferStatusEnum::FAILED) {
@@ -212,8 +210,8 @@ TEST_F(RDMATransportTest, MultipleRead) {
                 completed = true;
             }
         }
-        ret = engine->freeBatchID(batch_id);
-        ASSERT_EQ(ret, 0);
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
     }
     times = 10;
     while (times--) {
@@ -225,21 +223,22 @@ TEST_F(RDMATransportTest, MultipleRead) {
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        ret = engine->submitTransfer(batch_id, {entry});
-        ASSERT_EQ(ret, 0);
+        Status s;
+        s = engine->submitTransfer(batch_id, {entry});
+        ASSERT_EQ(s, Status::OK());
         bool completed = false;
         TransferStatus status;
         while (!completed) {
-            int ret = engine->getTransferStatus(batch_id, 0, status);
-            ASSERT_EQ(ret, 0);
+            Status s = engine->getTransferStatus(batch_id, 0, status);
+            ASSERT_EQ(s, Status::OK());
             if (status.s == TransferStatusEnum::COMPLETED)
                 completed = true;
             else if (status.s == TransferStatusEnum::FAILED) {
                 completed = true;
             }
         }
-        ret = engine->freeBatchID(batch_id);
-        ASSERT_EQ(ret, 0);
+        s = engine->freeBatchID(batch_id);
+        ASSERT_EQ(s, Status::OK());
         ret = memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                      kDataLength);
         ASSERT_EQ(ret, 0);
@@ -251,6 +250,7 @@ TEST_F(RDMATransportTest, MultipleRead) {
 }  // namespace mooncake
 
 int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

@@ -17,10 +17,12 @@ package p2pstore
 import (
 	"context"
 	"log"
+	"net"
+	"strconv"
 	"sync"
 )
 
-// When the data size larger than MAX_CHUNK_SIZE bytes, we split them into multiple buffers and registered seperately.
+// When the data size larger than MAX_CHUNK_SIZE bytes, we split them into multiple buffers and registered separately.
 // Warning: Memory registration is a SLOW operation.
 // MAX_CHUNK_SIZE must be an integer power of 2.
 // maxShardSize must be an integer power of 2, divisible by MAX_CHUNK_SIZE.
@@ -29,51 +31,79 @@ const MAX_CHUNK_SIZE uint64 = 4096 * 1024 * 1024
 const METADATA_KEY_PREFIX string = "mooncake/checkpoint/"
 
 type P2PStore struct {
-	metadataUri      string
-	localSegmentName string
-	catalog          *Catalog
-	memory           *RegisteredMemory
-	metadata         *Metadata
-	transfer         *TransferEngine
+	metadataConnString string
+	localServerName    string
+	catalog            *Catalog
+	memory             *RegisteredMemory
+	metadata           *Metadata
+	transfer           *TransferEngine
 }
 
-func NewP2PStore(metadataUri string, localSegmentName string, nicPriorityMatrix string) (*P2PStore, error) {
-	metadata, err := NewMetadata(metadataUri, METADATA_KEY_PREFIX)
+const DEFAULT_PORT int = 12345
+
+func parseServerName(serverName string) (host string, port int) {
+	host, portStr, err := net.SplitHostPort(serverName)
+	if err != nil {
+		log.Println("use default port for server name:", serverName)
+		return serverName, DEFAULT_PORT
+	}
+	port, err = strconv.Atoi(portStr)
+	if err != nil {
+		port = DEFAULT_PORT
+	}
+	return host, port
+}
+
+func NewP2PStore(metadataConnString string, localServerName string, nicPriorityMatrix string) (*P2PStore, error) {
+	metadata, err := NewMetadata(metadataConnString, METADATA_KEY_PREFIX)
 	if err != nil {
 		return nil, err
 	}
 
-	transferEngine, err := NewTransferEngine(metadataUri, localSegmentName, nicPriorityMatrix)
+	localIpAddressCStr, rpcPort := parseServerName(localServerName)
+	transfer, err := NewTransferEngine(metadataConnString, localServerName, localIpAddressCStr, rpcPort)
 	if err != nil {
-		innerErr := metadata.Close()
-		if innerErr != nil {
-			log.Println("cascading error:", innerErr)
-		}
+		metadata.Close()
+		return nil, err
+	}
+
+	if len(nicPriorityMatrix) == 0 {
+		err = transfer.installTransport("tcp", nicPriorityMatrix)
+	} else {
+		err = transfer.installTransport("rdma", nicPriorityMatrix)
+	}
+	if err != nil {
+		metadata.Close()
 		return nil, err
 	}
 
 	store := &P2PStore{
-		metadataUri:      metadataUri,
-		localSegmentName: localSegmentName,
-		catalog:          NewCatalog(),
-		memory:           NewRegisteredMemory(transferEngine, MAX_CHUNK_SIZE),
-		metadata:         metadata,
-		transfer:         transferEngine,
+		metadataConnString: metadataConnString,
+		localServerName:    localServerName,
+		catalog:            NewCatalog(),
+		memory:             NewRegisteredMemory(transfer, MAX_CHUNK_SIZE),
+		metadata:           metadata,
+		transfer:           transfer,
 	}
 	return store, nil
 }
 
 func (store *P2PStore) Close() error {
 	var retErr error = nil
-	err := store.transfer.Close()
-	if err != nil {
-		retErr = err
-	}
-	err = store.metadata.Close()
+	store.transfer.Close()
+	err := store.metadata.Close()
 	if err != nil {
 		retErr = err
 	}
 	return retErr
+}
+
+// GetLocalServerName returns the local server name (ip:port) that this
+// P2PStore instance is registered under. In P2P handshake mode the RPC
+// port is allocated dynamically, so callers must use this method to
+// discover the actual address after initialization.
+func (store *P2PStore) GetLocalServerName() (string, error) {
+	return store.transfer.GetLocalIpAndPort()
 }
 
 type Buffer struct {
@@ -90,7 +120,13 @@ func (store *P2PStore) unregisterBuffers(bufferList []Buffer, maxShardSize uint6
 	}
 }
 
-func (store *P2PStore) Register(ctx context.Context, name string, addrList []uintptr, sizeList []uint64, maxShardSize uint64, location string) error {
+func (store *P2PStore) Register(ctx context.Context,
+	name string,
+	addrList []uintptr,
+	sizeList []uint64,
+	maxShardSize uint64,
+	location string,
+	forceCreate bool) error {
 	if len(addrList) != len(sizeList) || len(addrList) == 0 {
 		return ErrInvalidArgument
 	}
@@ -121,7 +157,7 @@ func (store *P2PStore) Register(ctx context.Context, name string, addrList []uin
 				shardLength = size - offset
 			}
 			goldLocation := Location{
-				SegmentName: store.localSegmentName,
+				SegmentName: store.localServerName,
 				Offset:      uint64(addr) + offset,
 			}
 			shard := Shard{
@@ -133,7 +169,13 @@ func (store *P2PStore) Register(ctx context.Context, name string, addrList []uin
 		}
 	}
 
-	err := store.metadata.Put(ctx, name, &payload)
+	var err error
+	if forceCreate {
+		err = store.metadata.Put(ctx, name, &payload)
+	} else {
+		err = store.metadata.Create(ctx, name, &payload)
+	}
+
 	if err != nil {
 		store.unregisterBuffers(bufferList, maxShardSize)
 		return err
@@ -188,10 +230,10 @@ func (store *P2PStore) Unregister(ctx context.Context, name string) error {
 }
 
 type PayloadInfo struct {
-	Name         string   // Full name of checkpoint file
-	MaxShardSize uint64   //
-	TotalSize    uint64   //
-	SizeList     []uint64 //
+	Name         string
+	MaxShardSize uint64
+	TotalSize    uint64
+	SizeList     []uint64
 }
 
 func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadInfo, error) {
@@ -212,33 +254,13 @@ func (store *P2PStore) List(ctx context.Context, namePrefix string) ([]PayloadIn
 	return result, nil
 }
 
-// Get replica for same name multiple times in one P2P store will return ErrPayloadOpened
-func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []uintptr, sizeList []uint64) error {
-	if len(addrList) != len(sizeList) || len(addrList) == 0 {
-		return ErrInvalidArgument
-	}
-
-	if store.catalog.Contains(name) {
-		return ErrPayloadOpened
-	}
-
-	payload, revision, err := store.metadata.Get(ctx, name)
-	if err != nil {
-		return err
-	}
-
-	if payload == nil {
-		return ErrPayloadNotFound
-	}
-
+func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrList []uintptr, sizeList []uint64) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
 
 	var offset uint64 = 0
 	taskID := 0
 	maxShardSize := payload.MaxShardSize
-
-	_ = store.transfer.syncSegmentCache()
 
 	for i := 0; i < len(addrList); i++ {
 		addr, size := addrList[i], sizeList[i]
@@ -253,7 +275,7 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err = store.performTransfer(source, shard)
+				err = store.performTransfer(ctx, source, shard)
 				if err != nil {
 					select {
 					case errChan <- err:
@@ -273,15 +295,76 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 		}
 	default:
 	}
+	return nil
+}
 
+func contains(slice []Location, value Location) bool {
+	for _, item := range slice {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func isSubsetOf(old *Payload, new *Payload) bool {
+	if len(old.Shards) != len(new.Shards) {
+		return false
+	}
+	for i := 0; i < len(old.Shards); i += 1 {
+		for _, value := range old.Shards[i].Gold {
+			if !contains(new.Shards[i].Gold, value) {
+				return false
+			}
+		}
+		for _, value := range old.Shards[i].ReplicaList {
+			if !contains(new.Shards[i].ReplicaList, value) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []uintptr, sizeList []uint64) error {
+	if len(addrList) != len(sizeList) || len(addrList) == 0 {
+		return ErrInvalidArgument
+	}
+
+	if store.catalog.Contains(name) {
+		return ErrPayloadOpened
+	}
+
+	payload, revision, err := store.metadata.Get(ctx, name)
+	if err != nil {
+		return err
+	}
+	if payload == nil {
+		return ErrPayloadNotFound
+	}
+	for {
+		err = store.doGetReplica(ctx, payload, addrList, sizeList)
+		if err != nil {
+			return err
+		}
+		newPayload, recheckRevision, err := store.metadata.Get(ctx, name)
+		if err != nil {
+			return err
+		}
+		if revision == recheckRevision {
+			break
+		}
+		if isSubsetOf(payload, newPayload) {
+			break
+		}
+	}
 	return store.updatePayloadMetadata(ctx, name, addrList, sizeList, payload, revision)
 }
 
-func (store *P2PStore) performTransfer(source uintptr, shard Shard) error {
-	const MAX_RETRY_COUNT int = 8
+func (store *P2PStore) performTransfer(ctx context.Context, source uintptr, shard Shard) error {
 	retryCount := 0
-
-	for retryCount < MAX_RETRY_COUNT {
+	maxRetryCount := max(3, shard.Count())
+	for retryCount < maxRetryCount {
 		batchID, err := store.transfer.allocateBatchID(1)
 		if err != nil {
 			return err
@@ -292,7 +375,7 @@ func (store *P2PStore) performTransfer(source uintptr, shard Shard) error {
 			break
 		}
 
-		targetID, err := store.transfer.openSegment(location.SegmentName)
+		targetID, err := store.transfer.openSegment(location.SegmentName, retryCount == 0)
 		if err != nil {
 			return err
 		}
@@ -312,9 +395,14 @@ func (store *P2PStore) performTransfer(source uintptr, shard Shard) error {
 
 		var status int
 		for status == STATUS_WAITING || status == STATUS_PENDING {
-			status, _, err = store.transfer.getTransferStatus(batchID, 0)
-			if err != nil {
-				return err
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				status, _, err = store.transfer.getTransferStatus(batchID, 0)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -342,7 +430,7 @@ func (store *P2PStore) updatePayloadMetadata(ctx context.Context, name string, a
 			var offset uint64 = 0
 			for ; offset < size; offset += maxShardSize {
 				replicaLocation := Location{
-					SegmentName: store.localSegmentName,
+					SegmentName: store.localServerName,
 					Offset:      uint64(addr) + offset,
 				}
 				payload.Shards[taskID].ReplicaList = append(payload.Shards[taskID].ReplicaList, replicaLocation)
@@ -394,7 +482,7 @@ func (store *P2PStore) DeleteReplica(ctx context.Context, name string) error {
 		for idx, shard := range payload.Shards {
 			var newReplicaList []Location
 			for _, replica := range shard.ReplicaList {
-				if replica.SegmentName != store.localSegmentName {
+				if replica.SegmentName != store.localServerName {
 					newReplicaList = append(newReplicaList, replica)
 				}
 			}

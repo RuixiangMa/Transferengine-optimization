@@ -17,20 +17,29 @@
 
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
-#include <jsoncpp/json/json.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <string>
+#include <utility>
 
 namespace mooncake {
+
+enum class EndpointStoreType {
+    FIFO = 0,
+    SIEVE = 1,
+};
+
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
     uint8_t port = 1;
-    int gid_index = 0;
+    int gid_index = -1;       // -1 for auto-selection, >=0 for user-specified
+    uint16_t pkey_index = 0;  // QP attr.pkey_index; override via MC_PKEY_INDEX
+    uint64_t max_mr_size = 0x10000000000;
     size_t max_cqe = 4096;
-    int max_ep_per_ctx = 256;
+    int max_ep_per_ctx = 65536;
     size_t num_qp_per_ep = 2;
     size_t max_sge = 4;
     size_t max_wr = 256;
@@ -38,20 +47,57 @@ struct GlobalConfig {
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
     int workers_per_ctx = 2;
-    bool verbose = false;
     size_t slice_size = 65536;
-    int retry_cnt = 8;
+    int retry_cnt = 9;
+    int handshake_listen_backlog = 128;
+    bool metacache = true;
+    int log_level = google::INFO;
+    bool trace = false;
+    int64_t slice_timeout = -1;
+    uint16_t rpc_min_port = 15000;
+    uint16_t rpc_max_port = 17000;
+    bool use_ipv6 = false;
+    size_t fragment_limit = 16384;
+    bool enable_dest_device_affinity = false;
+    int parallel_reg_mr = -1;
+    size_t eic_max_block_size = 64UL * 1024 * 1024;
+    EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    int ib_traffic_class = -1;
+    // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
+    int ib_pci_relaxed_ordering_mode = 0;
+    bool ascend_use_fabric_mem = false;
+    bool ascend_agent_mode = false;
+    // ub config parameters
+    size_t num_jfc_per_ctx = 2;
+    size_t num_jfce_per_ctx = 2;
+    int eid_index = 0;
+    uint64_t max_seg_size = 0x10000000000;
+    size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
+    size_t num_jetty_per_ep = 1;
 };
 
-void loadGlobalConfig(GlobalConfig &config);
+struct RpcCommunicatorConfig {
+    std::string listen_address;
+    size_t thread_count = 0;
+    size_t timeout_seconds = 30;
+    size_t pool_size = 10;
+};
+
+void loadGlobalConfig(GlobalConfig& config);
 
 void dumpGlobalConfig();
 
-void updateGlobalConfig(ibv_device_attr &device_attr);
+void updateGlobalConfig(ibv_device_attr& device_attr);
 
-GlobalConfig &globalConfig();
+GlobalConfig& globalConfig();
 
 uint16_t getDefaultHandshakePort();
+
+// Validates a port range. Returns {default_min, default_max} on invalid input.
+// Rejects: min > max, well-known ports (0-1023), ephemeral ports (32768-60999).
+std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                      int default_min, int default_max);
+
 }  // namespace mooncake
 
 #endif  // CONFIG_H

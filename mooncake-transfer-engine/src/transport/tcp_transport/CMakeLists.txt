@@ -1,3 +1,8 @@
-file(GLOB CXL_SOURCES "*.cpp")
+file(GLOB TCP_SOURCES "*.cpp")
 
-add_library(tcp_transport OBJECT ${CXL_SOURCES})
+if (USE_HIP)
+  hipify_files(TCP_SOURCES)
+endif()
+
+add_library(tcp_transport OBJECT ${TCP_SOURCES})
+target_link_libraries(tcp_transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs)
