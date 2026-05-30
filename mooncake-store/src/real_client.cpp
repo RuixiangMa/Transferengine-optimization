@@ -32,6 +32,9 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -287,6 +290,7 @@ inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
     const Replica::Descriptor *first_memory = nullptr;
+    const Replica::Descriptor *first_nof = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_memory_replica()) {
@@ -296,9 +300,17 @@ inline const Replica::Descriptor *SelectBestReplica(
                 return &r;  // local MEMORY — best case
             }
             if (!first_memory) first_memory = &r;
+        } else if (r.is_nof_replica()) {
+            if (local_endpoints.count(
+                    r.get_nof_descriptor()
+                        .buffer_descriptor.transport_endpoint_)) {
+                return &r;  // local NOF_SSD — also good
+            }
+            if (!first_nof) first_nof = &r;
         }
     }
     if (first_memory) return first_memory;
+    if (first_nof) return first_nof;
 
     const Replica::Descriptor *best = nullptr;
     for (const auto &r : replicas) {
@@ -636,6 +648,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
+#ifdef USE_NOF
+    if (!SpdkWrapper::GetInstance().InitializeEnv()) {
+        LOG(ERROR) << "spdk env init fail";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+#endif
+
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
@@ -722,8 +741,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
+    bool use_spdk_dma_for_client_buffer = false;
+#ifdef USE_NOF
+    use_spdk_dma_for_client_buffer = true;
+#endif
     client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage);
+        local_buffer_size, this->protocol, should_use_hugepage,
+        use_spdk_dma_for_client_buffer);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -1057,6 +1081,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     stop_ipc_server();
+    stop_dummy_client_monitor();
     stop_http_server();
 
     if (!client_) {
@@ -2405,6 +2430,22 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     }
     shm_contexts_.erase(it);
     return {};
+}
+
+tl::expected<bool, ErrorCode> RealClient::is_shm_mapped_internal(
+    uint64_t dummy_base_addr, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto context_it = shm_contexts_.find(client_id);
+    if (context_it == shm_contexts_.end()) {
+        return false;
+    }
+
+    const auto target_addr = static_cast<uintptr_t>(dummy_base_addr);
+    const auto &mapped_shms = context_it->second.mapped_shms;
+    return std::any_of(mapped_shms.begin(), mapped_shms.end(),
+                       [target_addr](const MappedShm &shm) {
+                           return shm.dummy_base_addr == target_addr;
+                       });
 }
 
 tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
@@ -4540,10 +4581,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::chrono::duration_cast<std::chrono::microseconds>(
             end_time - start_read_store_time)
             .count();
-    LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time
-              << "us, read store: " << read_store_time
-              << "us, with memory key count: " << valid_operations.size()
-              << ", offload key count: " << offload_object_count;
+    // LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time
+    //           << "us, read store: " << read_store_time
+    //           << "us, with memory key count: " << valid_operations.size()
+    //           << ", offload key count: " << offload_object_count;
 
     return results;
 }
@@ -5145,6 +5186,13 @@ int RealClient::start_dummy_client_monitor() {
     return 0;
 }
 
+void RealClient::stop_dummy_client_monitor() {
+    dummy_client_monitor_running_ = false;
+    if (dummy_client_monitor_thread_.joinable()) {
+        dummy_client_monitor_thread_.join();
+        LOG(INFO) << "dummy_client_monitor_thread stopped";
+    }
+}
 int RealClient::start_ipc_server() {
     ipc_running_ = true;
     ipc_thread_ = std::jthread(&RealClient::ipc_server_func, this);
@@ -5430,6 +5478,7 @@ tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects) {
+    offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
