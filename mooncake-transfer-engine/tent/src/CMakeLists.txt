@@ -28,7 +28,8 @@ if(USE_HIP)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
   find_package(HIP REQUIRED)
   message(STATUS "ROCm/HIP: Enabled")
-  target_compile_definitions(tent_interface INTERFACE USE_HIP __HIP_PLATFORM_AMD__)
+  target_compile_definitions(tent_interface INTERFACE USE_HIP
+                                                      __HIP_PLATFORM_AMD__)
   target_include_directories(tent_interface INTERFACE ${HIP_INCLUDE_DIRS})
   target_link_libraries(tent_interface INTERFACE hip::host)
 else()
@@ -80,9 +81,10 @@ endif()
 if(USE_SUNRISE)
   target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
   target_include_directories(tent_interface INTERFACE /usr/local/tangrt/include)
-  target_link_directories(tent_interface INTERFACE
-                          /usr/local/tangrt/lib/linux-x86_64)
-  target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
+  target_link_libraries(
+    tent_interface
+    INTERFACE /usr/local/tangrt/lib/linux-x86_64/libtangrt_shared.so
+              /usr/local/tangrt/lib/linux-x86_64/libptml_shared.so dl)
 endif()
 
 set(YALANTING_TARGET yalantinglibs::yalantinglibs)

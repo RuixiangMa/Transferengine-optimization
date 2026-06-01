@@ -91,6 +91,23 @@ enum TransportType {
 };
 const static int kSupportedTransportTypes = (int)TransportType::UNSPEC;
 
+inline TransportType transportTypeFromProtocol(const std::string& protocol) {
+    static const std::unordered_map<std::string, TransportType> kMap = {
+        {"rdma", RDMA},
+        {"tcp", TCP},
+        {"shm", SHM},
+        {"nvlink", NVLINK},
+        {"gds", GDS},
+        {"io_uring", IOURING},
+        {"mnnvl", MNNVL},
+        {"ascend", AscendDirect},
+        {"ascend_direct", AscendDirect},
+        {"sunrise_link", SUNRISE_LINK},
+    };
+    auto it = kMap.find(protocol);
+    return it != kMap.end() ? it->second : UNSPEC;
+}
+
 struct MemoryOptions {
     Location location = kWildcardLocation;
     Permission perm = kGlobalReadWrite;

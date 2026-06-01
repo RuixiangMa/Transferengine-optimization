@@ -33,6 +33,7 @@
 #ifdef USE_TENT
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
+#include "tent/common/types.h"
 #endif
 
 #include "cuda_alike.h"
@@ -90,7 +91,7 @@ DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma",
               "Transfer protocol: "
-              "rdma|barex|tcp|efa|nvlink|nvlink_intra|hip|sunrise_link");
+              "rdma|barex|tcp|efa|nvlink|nvlink_intra|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -512,8 +513,7 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
                FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra" ||
-               FLAGS_protocol == "ubshmem" ||
-               FLAGS_protocol == "sunrise_link") {
+               FLAGS_protocol == "ubshmem") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
@@ -630,7 +630,14 @@ namespace tent_backend {
 static void registerBuffers(mooncake::tent::TransferEngine* engine,
                             std::vector<void*>& addr) {
     for (int i = 0; i < buffer_num; ++i) {
-        auto status = engine->registerLocalMemory(addr[i], FLAGS_buffer_size);
+        mooncake::tent::MemoryOptions options;
+        auto transport_type =
+            mooncake::tent::transportTypeFromProtocol(FLAGS_protocol);
+        if (transport_type != mooncake::tent::UNSPEC) {
+            options.type = transport_type;
+        }
+        auto status =
+            engine->registerLocalMemory(addr[i], FLAGS_buffer_size, options);
         LOG_ASSERT(status.ok())
             << "Failed to register memory: " << status.ToString();
     }
@@ -672,6 +679,30 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
     config->set("metadata_servers", metadata_servers);
     config->set("local_segment_name", FLAGS_local_server_name);
     config->set("verbose", true);
+
+    static const char* kAllTransportEnableKeys[] = {
+        "tcp",   "shm", "rdma",          "io_uring",     "nvlink",
+        "mnnvl", "gds", "ascend_direct", "sunrise_link",
+    };
+
+    if (protocolRequiresTentBackend(FLAGS_protocol)) {
+        for (const auto& key : kAllTransportEnableKeys) {
+            config->set("transports/" + std::string(key) + "/enable", false);
+        }
+        auto transport_type =
+            mooncake::tent::transportTypeFromProtocol(FLAGS_protocol);
+        if (transport_type != mooncake::tent::UNSPEC) {
+            std::string config_key;
+            switch (transport_type) {
+                case mooncake::tent::AscendDirect:
+                    config_key = "ascend_direct";
+                    break;
+                default:
+                    config_key = FLAGS_protocol;
+            }
+            config->set("transports/" + config_key + "/enable", true);
+        }
+    }
 
     return config;
 }
@@ -817,11 +848,11 @@ int target() {
         return EXIT_FAILURE;
     }
 
-    LOG(INFO) << "TENT target started, segment name: "
-              << engine->getSegmentName();
-
     auto addr = allocateBuffers();
     registerBuffers(engine.get(), addr);
+
+    LOG(INFO) << "TENT target ready, segment name: " << engine->getSegmentName()
+              << ", buffers registered: " << addr.size();
 
     while (target_running) sleep(1);
 
@@ -847,6 +878,22 @@ void check_total_buffer_size() {
 int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     check_total_buffer_size();
+
+    if (protocolRequiresTentBackend(FLAGS_protocol)) {
+#ifdef USE_TENT
+        if (FLAGS_backend != "tent") {
+            LOG(INFO)
+                << "Protocol '" << FLAGS_protocol
+                << "' requires TENT backend, overriding --backend to tent";
+            FLAGS_backend = "tent";
+        }
+#else
+        LOG(ERROR)
+            << "Protocol '" << FLAGS_protocol
+            << "' requires TENT backend. Please rebuild with -DUSE_TENT=ON";
+        exit(EXIT_FAILURE);
+#endif
+    }
 
 #if defined(USE_UBSHMEM)
     if (FLAGS_gpu_id != -1) {

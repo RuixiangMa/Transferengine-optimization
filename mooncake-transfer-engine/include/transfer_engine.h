@@ -61,9 +61,11 @@ class TransferEngine {
     };
 #endif
 
-    TransferEngine(bool auto_discover = false);
+    TransferEngine(bool auto_discover = false,
+                   const std::string& protocol = "");
 
-    TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
+    TransferEngine(bool auto_discover, const std::vector<std::string>& filter,
+                   const std::string& protocol = "");
 
     ~TransferEngine();
 
@@ -178,6 +180,7 @@ class TransferEngine {
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     bool use_tent_{false};
+    std::string protocol_;
 };
 }  // namespace mooncake
 

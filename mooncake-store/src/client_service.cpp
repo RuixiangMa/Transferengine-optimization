@@ -627,7 +627,8 @@ ErrorCode Client::InitTransferEngine(
     const std::optional<std::string>& device_names) {
     // Check if using TENT mode - TENT handles transport configuration
     // internally
-    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
+    bool use_tent = protocolRequiresTentBackend(protocol) ||
+                    (std::getenv("MC_USE_TENT") != nullptr) ||
                     (std::getenv("MC_USE_TEV1") != nullptr);
 
     bool auto_discover = false;
@@ -902,7 +903,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // Initialize transfer engine
     if (transfer_engine == nullptr) {
-        client->transfer_engine_ = std::make_shared<TransferEngine>();
+        client->transfer_engine_ =
+            std::make_shared<TransferEngine>(false, protocol);
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
                                          protocol, device_names);
         if (err != ErrorCode::OK) {
