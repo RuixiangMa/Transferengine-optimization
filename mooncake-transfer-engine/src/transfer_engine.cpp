@@ -19,11 +19,13 @@
 
 namespace mooncake {
 
-TransferEngine::TransferEngine(bool auto_discover)
+TransferEngine::TransferEngine(bool auto_discover,
+                               const std::string& /*protocol*/)
     : impl_(std::make_shared<TransferEngineImpl>(auto_discover)) {}
 
 TransferEngine::TransferEngine(bool auto_discover,
-                               const std::vector<std::string>& filter)
+                               const std::vector<std::string>& filter,
+                               const std::string& /*protocol*/)
     : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)) {}
 
 TransferEngine::~TransferEngine() { freeEngine(); }
@@ -212,28 +214,31 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
 }  // namespace mooncake
 #else
 #include "transfer_engine.h"
+#include "common.h"
 #include "transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
+#include "tent/common/types.h"
 
 #include <utility>
 
 namespace mooncake {
 
-TransferEngine::TransferEngine(bool auto_discover) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
-        use_tent_ = true;
-    }
+TransferEngine::TransferEngine(bool auto_discover, const std::string& protocol)
+    : protocol_(protocol) {
+    use_tent_ = protocolRequiresTentBackend(protocol_) ||
+                getenv("MC_USE_TENT") || getenv("MC_USE_TEV1");
     if (!use_tent_) {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover);
     }
 }
 
 TransferEngine::TransferEngine(bool auto_discover,
-                               const std::vector<std::string>& filter) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
-        use_tent_ = true;
-    }
+                               const std::vector<std::string>& filter,
+                               const std::string& protocol)
+    : protocol_(protocol) {
+    use_tent_ = protocolRequiresTentBackend(protocol_) ||
+                getenv("MC_USE_TENT") || getenv("MC_USE_TEV1");
     if (!use_tent_) {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover, filter);
     }
@@ -267,6 +272,11 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name,
                          uint64_t rpc_port) {
+    if (protocolRequiresTentBackend(protocol_) &&
+        tent::transportTypeFromProtocol(protocol_) == tent::UNSPEC) {
+        LOG(ERROR) << "Unrecognized protocol '" << protocol_ << "'";
+        return -1;
+    }
     if (!use_tent_) {
         return impl_->init(metadata_conn_string, local_server_name,
                            ip_or_host_name, rpc_port);
@@ -373,6 +383,15 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
         mooncake::tent::MemoryOptions option;
         if (!location.empty() && location != kWildcardLocation)
             option.location = location;
+        if (protocolRequiresTentBackend(protocol_)) {
+            auto transport_type = tent::transportTypeFromProtocol(protocol_);
+            if (transport_type == tent::UNSPEC) {
+                LOG(ERROR) << "Unrecognized protocol '" << protocol_
+                           << "' for TENT memory registration";
+                return -1;
+            }
+            option.type = transport_type;
+        }
         auto status = impl_tent_->registerLocalMemory(addr, length, option);
         return (int)status.code();
     } else
@@ -394,6 +413,15 @@ int TransferEngine::registerLocalMemoryBatch(
         mooncake::tent::MemoryOptions option;
         if (!location.empty() && location != kWildcardLocation)
             option.location = location;
+        if (protocolRequiresTentBackend(protocol_)) {
+            auto transport_type = tent::transportTypeFromProtocol(protocol_);
+            if (transport_type == tent::UNSPEC) {
+                LOG(ERROR) << "Unrecognized protocol '" << protocol_
+                           << "' for TENT memory registration";
+                return -1;
+            }
+            option.type = transport_type;
+        }
         std::vector<void*> addr_list;
         std::vector<size_t> size_list;
         for (auto& buffer : buffer_list) {

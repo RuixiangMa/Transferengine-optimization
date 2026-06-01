@@ -4,6 +4,7 @@
 #include <string>
 
 #include "common.h"
+#include "transfer_engine.h"
 
 namespace {
 
@@ -258,6 +259,26 @@ TEST(GetHandshakeMaxLengthTest, ReturnsSameValueOnMultipleCalls) {
     size_t first_call = getHandshakeMaxLength();
     size_t second_call = getHandshakeMaxLength();
     EXPECT_EQ(first_call, second_call);
+}
+
+//------------------------------------------------------------------------------
+// protocolRequiresTentBackend
+//------------------------------------------------------------------------------
+
+TEST(ProtocolRequiresTentBackend, SunriseLink) {
+    EXPECT_TRUE(protocolRequiresTentBackend("sunrise_link"));
+}
+
+TEST(ProtocolRequiresTentBackend, Rdma) {
+    EXPECT_FALSE(protocolRequiresTentBackend("rdma"));
+}
+
+TEST(ProtocolRequiresTentBackend, Empty) {
+    EXPECT_FALSE(protocolRequiresTentBackend(""));
+}
+
+TEST(ProtocolRequiresTentBackend, Unknown) {
+    EXPECT_FALSE(protocolRequiresTentBackend("unknown_proto"));
 }
 
 }  // namespace
