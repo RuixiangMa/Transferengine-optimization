@@ -26,6 +26,7 @@
 #include <set>
 #include <ylt/struct_json/json_reader.h>
 
+#include "common.h"
 #include "transfer_engine.h"
 #include "topology.h"
 #include "transfer_task.h"

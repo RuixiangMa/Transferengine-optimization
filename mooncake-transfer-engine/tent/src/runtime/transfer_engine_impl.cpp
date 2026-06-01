@@ -74,7 +74,7 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> local_segment_name;
     std::optional<std::string> rpc_server_hostname;
     std::optional<json> rpc_server_port;
-    std::unordered_map<std::string, std::optional<bool>> transport_enables;
+    std::unordered_map<std::string, bool> transport_enables;
 };
 
 static const char* kTransportEnableKeys[] = {
@@ -194,9 +194,7 @@ void restoreExplicitTransferEngineConfig(
     restoreExplicitConfigValue(config, "rpc_server_port",
                                preserved.rpc_server_port);
     for (const auto& [key, value] : preserved.transport_enables) {
-        if (value.has_value()) {
-            config.set(key, *value);
-        }
+        config.set(key, value);
     }
 }
 

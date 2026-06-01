@@ -19,6 +19,7 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "common.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_EFA
