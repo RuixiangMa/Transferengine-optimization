@@ -25,16 +25,30 @@ namespace tent {
 // Transport type name mapping
 static const std::unordered_map<std::string, TransportType> kTransportNameMap =
     {
-        {"rdma", RDMA},           {"tcp", TCP},     {"shm", SHM},
-        {"nvlink", NVLINK},       {"gds", GDS},     {"io_uring", IOURING},
-        {"ascend", AscendDirect}, {"mnnvl", MNNVL},
+        {"rdma", RDMA},
+        {"tcp", TCP},
+        {"shm", SHM},
+        {"nvlink", NVLINK},
+        {"gds", GDS},
+        {"io_uring", IOURING},
+        {"ascend", AscendDirect},
+        {"ascend_direct", AscendDirect},
+        {"mnnvl", MNNVL},
+        {"sunrise_link", SUNRISE_LINK},
 };
 
 static const std::unordered_map<TransportType, std::string>
     kTransportTypeNames = {
-        {RDMA, "rdma"},           {TCP, "tcp"},     {SHM, "shm"},
-        {NVLINK, "nvlink"},       {GDS, "gds"},     {IOURING, "io_uring"},
-        {AscendDirect, "ascend"}, {MNNVL, "mnnvl"}, {UNSPEC, "unspec"},
+        {RDMA, "rdma"},
+        {TCP, "tcp"},
+        {SHM, "shm"},
+        {NVLINK, "nvlink"},
+        {GDS, "gds"},
+        {IOURING, "io_uring"},
+        {AscendDirect, "ascend"},
+        {MNNVL, "mnnvl"},
+        {SUNRISE_LINK, "sunrise_link"},
+        {UNSPEC, "unspec"},
 };
 
 // Memory type name mapping for pattern matching

@@ -181,6 +181,8 @@ TEST(TransportSelectorTest, TransportTypeNameMapping) {
     EXPECT_EQ(TransportSelector::transportTypeName(IOURING), "io_uring");
     EXPECT_EQ(TransportSelector::transportTypeName(AscendDirect), "ascend");
     EXPECT_EQ(TransportSelector::transportTypeName(MNNVL), "mnnvl");
+    EXPECT_EQ(TransportSelector::transportTypeName(SUNRISE_LINK),
+              "sunrise_link");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
@@ -191,7 +193,11 @@ TEST(TransportSelectorTest, ParseTransportType) {
     EXPECT_EQ(TransportSelector::parseTransportType("gds"), GDS);
     EXPECT_EQ(TransportSelector::parseTransportType("io_uring"), IOURING);
     EXPECT_EQ(TransportSelector::parseTransportType("ascend"), AscendDirect);
+    EXPECT_EQ(TransportSelector::parseTransportType("ascend_direct"),
+              AscendDirect);
     EXPECT_EQ(TransportSelector::parseTransportType("mnnvl"), MNNVL);
+    EXPECT_EQ(TransportSelector::parseTransportType("sunrise_link"),
+              SUNRISE_LINK);
     EXPECT_EQ(TransportSelector::parseTransportType("unknown"), UNSPEC);
 }
 

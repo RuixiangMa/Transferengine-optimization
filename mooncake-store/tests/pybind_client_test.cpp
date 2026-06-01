@@ -648,7 +648,7 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto transfer_engine = std::make_shared<TransferEngine>("P2PHANDSHAKE");
+    auto transfer_engine = std::make_shared<TransferEngine>(true);
 
     // The auto discover has some problems in GitHub CI, so disable it here.
     transfer_engine->setAutoDiscover(false);

@@ -185,6 +185,20 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
     std::string proto = protocol ? std::string(protocol) : "";
     std::string conn_string = buildConnString(metadata_type, metadata_server);
+    const bool use_tent_backend = protocolRequiresTentBackend(proto) ||
+                                  getenv("MC_USE_TENT") ||
+                                  getenv("MC_USE_TEV1");
+
+    if (use_tent_backend) {
+#ifdef USE_TENT
+        LOG(INFO) << "Using TENT backend for protocol: " << proto;
+#else
+        LOG(ERROR)
+            << "Protocol '" << proto
+            << "' requires TENT backend. Please rebuild with -DUSE_TENT=ON";
+        return -1;
+#endif
+    }
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
@@ -195,16 +209,16 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     bool use_efa = (proto == "efa");
     // Disable auto_discover to prevent RDMA transport installation, we'll
     // install EFA manually
-    engine_ = std::make_unique<TransferEngine>(false, device_filter);
+    engine_ = std::make_unique<TransferEngine>(false, device_filter, proto);
     // Manually discover topology for EFA to populate device list
-    if (use_efa) {
+    if (use_efa && !use_tent_backend) {
         engine_->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for EFA. Found "
                   << engine_->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
+    engine_ = std::make_unique<TransferEngine>(true, device_filter, proto);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
@@ -221,7 +235,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
 #ifdef USE_EFA
     // Install EFA transport when protocol is "efa"
-    if (use_efa) {
+    if (use_tent_backend) {
+        LOG(INFO) << "Skipping classic installTransport path for TENT backend";
+    } else if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
         auto transport = engine_->installTransport("efa", nullptr);

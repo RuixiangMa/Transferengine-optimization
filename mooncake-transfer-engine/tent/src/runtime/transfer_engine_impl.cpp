@@ -22,6 +22,7 @@
 #include <map>
 #include <optional>
 #include <random>
+#include <unordered_map>
 #include <stdexcept>
 
 #include "tent/common/config.h"
@@ -73,6 +74,15 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> local_segment_name;
     std::optional<std::string> rpc_server_hostname;
     std::optional<json> rpc_server_port;
+    std::unordered_map<std::string, std::optional<bool>> transport_enables;
+};
+
+static const char* kTransportEnableKeys[] = {
+    "transports/tcp/enable",          "transports/shm/enable",
+    "transports/rdma/enable",         "transports/io_uring/enable",
+    "transports/nvlink/enable",       "transports/mnnvl/enable",
+    "transports/gds/enable",          "transports/ascend_direct/enable",
+    "transports/sunrise_link/enable",
 };
 
 template <typename T>
@@ -155,6 +165,11 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "rpc_server_hostname", std::string());
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
+    for (const auto& key : kTransportEnableKeys) {
+        if (config.contains(key)) {
+            preserved.transport_enables[key] = config.get<bool>(key, false);
+        }
+    }
     return preserved;
 }
 
@@ -178,6 +193,11 @@ void restoreExplicitTransferEngineConfig(
                                preserved.rpc_server_hostname);
     restoreExplicitConfigValue(config, "rpc_server_port",
                                preserved.rpc_server_port);
+    for (const auto& [key, value] : preserved.transport_enables) {
+        if (value.has_value()) {
+            config.set(key, *value);
+        }
+    }
 }
 
 TransferEngineImpl::TransferEngineImpl()
@@ -948,6 +968,8 @@ static const char* transportTypeName(TransportType type) {
             return "TCP";
         case AscendDirect:
             return "AscendDirect";
+        case SUNRISE_LINK:
+            return "SUNRISE_LINK";
         default:
             return "UNSPEC";
     }

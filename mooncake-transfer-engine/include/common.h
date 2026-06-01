@@ -74,6 +74,18 @@ static inline std::string getHostname() {
     return hostname;
 }
 
+// Protocols listed here must also have a corresponding entry in
+// tent::transportTypeFromProtocol() (tent/common/types.h).
+static inline bool protocolRequiresTentBackend(const std::string &protocol) {
+    static const std::string_view kTentProtocols[] = {
+        "sunrise_link",
+    };
+    for (const auto &p : kTentProtocols) {
+        if (p == protocol) return true;
+    }
+    return false;
+}
+
 static inline int bindToSocket(int socket_id) {
     if (unlikely(numa_available() < 0)) {
         LOG(WARNING) << "The platform does not support NUMA";
