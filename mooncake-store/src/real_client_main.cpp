@@ -66,6 +66,11 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::ascend_ipc_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_unmap_shm_internal>(
         &real_client);
+#if defined(USE_SUNRISE)
+    server.register_handler<&RealClient::sunrise_shm_internal>(&real_client);
+    server.register_handler<&RealClient::sunrise_unmap_shm_internal>(
+        &real_client);
+#endif
     server.register_handler<&RealClient::is_shm_mapped_internal>(&real_client);
     server.register_handler<&RealClient::unmap_shm_internal>(&real_client);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(
@@ -105,6 +110,9 @@ int main(int argc, char *argv[]) {
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.
     globalConfig().ascend_agent_mode = true;
+#endif
+#if defined(USE_SUNRISE)
+    globalConfig().sunrise_agent_mode = true;
 #endif
 
     auto client_inst = RealClient::create();

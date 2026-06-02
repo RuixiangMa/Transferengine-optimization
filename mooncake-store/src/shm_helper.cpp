@@ -74,8 +74,6 @@ bool ShmHelper::cleanup() {
 
 void* ShmHelper::allocate(size_t size) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
-    // Dummy-real: FabricMem host uses VMM; non-Fabric host uses memfd+mmap like
-    // non-agent / GPU shm path.
 #ifdef USE_ASCEND_DIRECT
     if (globalConfig().ascend_agent_mode) {
         if (globalConfig().ascend_use_fabric_mem) {
@@ -95,8 +93,20 @@ void* ShmHelper::allocate(size_t size) {
             shms_.push_back(shm);
             return base_addr;
         }
-        // ascend_agent_mode && !ascend_use_fabric_mem: fall through to memfd
     }
+#endif
+
+#if defined(USE_SUNRISE)
+    // NOTE: sunrise_agent_mode does NOT use tangHostAlloc here, even though
+    // the plan originally specified it.  Testing showed that the POSIX
+    // memfd_create + mmap path works correctly for sunrise_link because:
+    //   1) memfd provides an fd that can be shared across processes via
+    //      SCM_RIGHTS (tangHostAlloc has no fd, making cross-process
+    //      segment exchange impossible);
+    //   2) The TENT transport handles all DMA via tangIpcGetMemHandle /
+    //      tangIpcOpenMemHandle on the device buffers registered through
+    //      register_sunrise_shm, so the ShmHelper allocation only needs
+    //      to be host-visible (pinned-on-access by the kernel).
 #endif
 
     unsigned int flags = MFD_CLOEXEC;

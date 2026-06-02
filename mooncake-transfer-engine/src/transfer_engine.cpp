@@ -330,8 +330,7 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
 
 std::string TransferEngine::getLocalIpAndPort() {
     if (use_tent_) {
-        return impl_tent_->getRpcServerAddress() + ":" +
-               std::to_string(impl_tent_->getRpcServerPort());
+        return impl_tent_->getSegmentName();
     } else
         return impl_->getLocalIpAndPort();
 }

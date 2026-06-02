@@ -25,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -45,13 +46,14 @@ namespace {
 // Default matches typical Tang RT install; override root and/or arch via env.
 static std::string TangRtSharedObjectPath(const char* soname) {
     const char* root = std::getenv("MC_TANGRT_ROOT");
-    std::string r = (root && root[0]) ? std::string(root)
-                                      : std::string("/usr/local/tangrt");
-    while (!r.empty() && r.back() == '/') r.pop_back();
-    const char* arch = std::getenv("MC_TANGRT_LIB_ARCH");
-    std::string arch_dir =
-        (arch && arch[0]) ? std::string(arch) : std::string("linux-x86_64");
-    return r + "/lib/" + arch_dir + "/" + soname;
+     std::string r = (root && root[0]) ? std::string(root)
+                                       : std::string("/usr/local/tangrt");
+     while (!r.empty() && r.back() == '/') r.pop_back();
+     const char* arch = std::getenv("MC_TANGRT_LIB_ARCH");
+     if (arch && arch[0]) {
+         return r + "/lib/" + std::string(arch) + "/" + soname;
+     }
+     return r + "/lib/" + soname;
 }
 
 constexpr int kMaxPhytopoPorts = 10;
@@ -77,41 +79,25 @@ static void NormalizeMappedHostPointer(void** ptr,
                                        tangPointerAttributes* attr) {
     if (!ptr || !*ptr || !attr) return;
     if (attr->type != tangMemoryTypeHost) return;
-
-    void* dev_ptr = nullptr;
-    tangError_t ret = tangHostGetDevicePointer(&dev_ptr, *ptr, 0);
-    if (ret != tangSuccess || !dev_ptr) return;
-
-    tangPointerAttributes dev_attr = {};
-    tangPointerGetAttributes(&dev_attr, dev_ptr);
-    if (dev_attr.type == tangMemoryTypeDevice) {
-        *ptr = dev_ptr;
-        *attr = dev_attr;
-    }
 }
 
 static tangError_t QueryPointerAttrsBestEffort(void* ptr,
                                                tangPointerAttributes* attr,
                                                int preferred_dev) {
     if (!ptr || !attr) return tangErrorInvalidValue;
-    tangError_t ret = tangPointerGetAttributes(attr, ptr);
-    if (ret == tangSuccess) return ret;
-
-    if (preferred_dev >= 0) {
-        tangSetDevice(preferred_dev);
-        ret = tangPointerGetAttributes(attr, ptr);
-        if (ret == tangSuccess) return ret;
+    if (preferred_dev < 0) {
+        attr->type = tangMemoryTypeUnregistered;
+        return tangErrorInvalidValue;
     }
-
-    int dev_count = 0;
-    if (tangGetDeviceCount(&dev_count) != tangSuccess || dev_count <= 0) {
+    int saved_dev = -1;
+    tangGetDevice(&saved_dev);
+    tangError_t ret = tangSetDevice(preferred_dev);
+    if (ret != tangSuccess) {
+        if (saved_dev >= 0) tangSetDevice(saved_dev);
         return ret;
     }
-    for (int d = 0; d < dev_count; ++d) {
-        tangSetDevice(d);
-        ret = tangPointerGetAttributes(attr, ptr);
-        if (ret == tangSuccess) return ret;
-    }
+    ret = tangPointerGetAttributes(attr, ptr);
+    if (saved_dev >= 0) tangSetDevice(saved_dev);
     return ret;
 }
 
@@ -263,6 +249,21 @@ class ThreadLocalTangStreamPool {
 
 thread_local ThreadLocalTangStreamPool tl_stream_pool;
 
+namespace {
+
+struct ProcessRuntimeState {
+    void* ptml_handle = nullptr;
+    void* tang_handle = nullptr;
+    std::once_flag init_flag;
+};
+
+static ProcessRuntimeState& processRuntime() {
+    static ProcessRuntimeState state;
+    return state;
+}
+
+}
+
 SunriseLinkTransport::SunriseLinkTransport() : installed_(false) {
     // Match NVLink-style caps: routing may see MTYPE_CPU if pointer probe fails
     // while the remote segment is VRAM; dram_to_gpu must still be available.
@@ -270,6 +271,7 @@ SunriseLinkTransport::SunriseLinkTransport() : installed_(false) {
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
     caps.gpu_to_gpu = true;
+    caps.same_machine_only = true;
 }
 
 SunriseLinkTransport::~SunriseLinkTransport() { uninstall(); }
@@ -310,52 +312,71 @@ Status SunriseLinkTransport::install(std::string& local_segment_name,
 }
 
 Status SunriseLinkTransport::initSunriseLink() {
-    ptml_handle_ =
-        dlopen(TangRtSharedObjectPath("libptml_shared.so").c_str(), RTLD_NOW);
-    if (!ptml_handle_) {
-        char* error = dlerror();
-        LOG(ERROR) << "Failed to load libptml_shared.so: "
-                   << (error ? error : "unknown error");
-        return Status::InternalError("Failed to load PTML library");
-    }
+    auto& rt = processRuntime();
+    try {
+        std::call_once(rt.init_flag, [&rt]() {
+            rt.ptml_handle =
+                dlopen(TangRtSharedObjectPath("libptml_shared.so").c_str(), RTLD_NOW);
+            if (!rt.ptml_handle) {
+                char* error = dlerror();
+                throw std::runtime_error(
+                    std::string("Failed to load libptml_shared.so: ") +
+                    (error ? error : "unknown error"));
+            }
 
 #define LOAD_PTML_SYM(handle, symbol, funcptr)                       \
     do {                                                             \
         void* tmp = dlsym(handle, symbol);                           \
         if (tmp == nullptr) {                                        \
-            LOG(ERROR) << "dlsym failed on " << symbol;              \
-            return Status::InternalError("Failed to load " #symbol); \
+            throw std::runtime_error(                                \
+                std::string("dlsym failed on ") + symbol);           \
         }                                                            \
         *(void**)&funcptr = tmp;                                     \
     } while (0)
 
-    LOAD_PTML_SYM(ptml_handle_, "ptmlInit", ptmlInit);
-    LOAD_PTML_SYM(ptml_handle_, "ptmlPtlinkEnableAll", ptmlPtlinkEnableAll);
-    LOAD_PTML_SYM(ptml_handle_, "ptmlPtlinkPhytopoDetect",
-                  ptmlPtlinkPhytopoDetect);
-    LOAD_PTML_SYM(ptml_handle_, "ptmlDeviceGetCount", ptmlDeviceGetCount);
+            LOAD_PTML_SYM(rt.ptml_handle, "ptmlInit", ptmlInit);
+            LOAD_PTML_SYM(rt.ptml_handle, "ptmlPtlinkEnableAll", ptmlPtlinkEnableAll);
+            LOAD_PTML_SYM(rt.ptml_handle, "ptmlPtlinkPhytopoDetect",
+                          ptmlPtlinkPhytopoDetect);
+            LOAD_PTML_SYM(rt.ptml_handle, "ptmlDeviceGetCount", ptmlDeviceGetCount);
 
-    ptmlReturn_t ret = ptmlInit();
-    if (ret != PTML_SUCCESS) {
-        LOG(ERROR) << "ptmlInit failed, error code: " << ret;
-        return Status::InternalError("Failed to initialize PTML");
+#undef LOAD_PTML_SYM
+
+            ptmlReturn_t ret = ptmlInit();
+            if (ret != PTML_SUCCESS) {
+                throw std::runtime_error(
+                    "ptmlInit failed, error code: " + std::to_string(ret));
+            }
+
+            ret = ptmlPtlinkEnableAll();
+            if (ret != PTML_SUCCESS) {
+                LOG(WARNING) << "ptmlPtlinkEnableAll failed, error code: " << ret;
+            }
+
+            rt.tang_handle =
+                dlopen(TangRtSharedObjectPath("libtangrt_shared.so").c_str(), RTLD_NOW);
+            if (!rt.tang_handle) {
+                char* error = dlerror();
+                dlclose(rt.ptml_handle);
+                rt.ptml_handle = nullptr;
+                throw std::runtime_error(
+                    std::string("Failed to load libtangrt_shared.so: ") +
+                    (error ? error : "unknown error"));
+            }
+
+            LOG(INFO) << "SunriseLink process-level runtime initialized (PTML + Tang)";
+        });
+    } catch (const std::exception& e) {
+        return Status::InternalError(
+            std::string("SunriseLink runtime init failed: ") + e.what());
     }
 
-    ret = ptmlPtlinkEnableAll();
-    if (ret != PTML_SUCCESS) {
-        LOG(WARNING) << "ptmlPtlinkEnableAll failed, error code: " << ret;
+    if (!rt.ptml_handle || !rt.tang_handle) {
+        return Status::InternalError("SunriseLink runtime initialization failed");
     }
 
-    runtime_lib_handle_ =
-        dlopen(TangRtSharedObjectPath("libtangrt_shared.so").c_str(), RTLD_NOW);
-    if (!runtime_lib_handle_) {
-        char* error = dlerror();
-        LOG(ERROR) << "Failed to load libtangrt_shared.so: "
-                   << (error ? error : "unknown error");
-        return Status::InternalError("Failed to load Tang library");
-    }
-
-    LOG(INFO) << "SunriseLink runtime initialized successfully (PTML + Tang)";
+    ptml_handle_ = rt.ptml_handle;
+    runtime_lib_handle_ = rt.tang_handle;
     return Status::OK();
 }
 
@@ -658,16 +679,41 @@ Status SunriseLinkTransport::startTransfer(SunriseLinkTask* task,
     tangPointerAttributes da = {};
     if (task->tang_gpu_id >= 0) tangSetDevice(task->tang_gpu_id);
 
-    // Intentionally no mutex here: a global lock on pointer-attribute queries
-    // serialized all peer copies across threads and capped throughput at a few
-    // MiB/s in multi-threaded benches. Tang is expected to tolerate concurrent
-    // attribute reads for different pointers.
+    int src_dev_hint = infer_local_dev(src);
+    int dst_dev_hint = infer_local_dev(dst);
+    int probe_dev_src = (task->tang_gpu_id >= 0) ? task->tang_gpu_id
+                        : (src_dev_hint >= 0) ? src_dev_hint : -1;
+    int probe_dev_dst = (task->tang_gpu_id >= 0) ? task->tang_gpu_id
+                        : (dst_dev_hint >= 0) ? dst_dev_hint : -1;
+
     tangError_t src_attr_ret =
-        QueryPointerAttrsBestEffort(src, &sa, task->tang_gpu_id);
+        QueryPointerAttrsBestEffort(src, &sa, probe_dev_src);
     tangError_t dst_attr_ret =
-        QueryPointerAttrsBestEffort(dst, &da, task->tang_gpu_id);
-    NormalizeMappedHostPointer(&src, &sa);
-    NormalizeMappedHostPointer(&dst, &da);
+        QueryPointerAttrsBestEffort(dst, &da, probe_dev_dst);
+
+    if (src_attr_ret != tangSuccess && src_dev_hint >= 0) {
+        sa.type = tangMemoryTypeDevice;
+        sa.device = src_dev_hint;
+    }
+    if (dst_attr_ret != tangSuccess && dst_dev_hint >= 0) {
+        da.type = tangMemoryTypeDevice;
+        da.device = dst_dev_hint;
+    }
+    if (src_attr_ret != tangSuccess && src_dev_hint < 0
+        && probe_dev_src < 0) {
+        sa.type = tangMemoryTypeHost;
+    }
+    if (dst_attr_ret != tangSuccess && dst_dev_hint < 0
+        && probe_dev_dst < 0) {
+        da.type = tangMemoryTypeHost;
+    }
+
+    if (src_attr_ret == tangSuccess) {
+        NormalizeMappedHostPointer(&src, &sa);
+    }
+    if (dst_attr_ret == tangSuccess) {
+        NormalizeMappedHostPointer(&dst, &da);
+    }
 
     int src_dev = (sa.type == tangMemoryTypeDevice) ? sa.device : -1;
     int dst_dev = (da.type == tangMemoryTypeDevice) ? da.device : -1;
@@ -1048,10 +1094,8 @@ Status SunriseLinkTransport::uninstall() {
             registered_memory_gpu_id_.clear();
         }
 
-        if (runtime_lib_handle_) {
-            dlclose(runtime_lib_handle_);
-            runtime_lib_handle_ = nullptr;
-        }
+        // Do NOT dlclose ptml_handle_ or runtime_lib_handle_ — they are
+        // process-lifetime resources managed by ProcessRuntimeState.
 
         for (auto& seg_entry : relocate_map_) {
             for (auto& entry : seg_entry.second) {
@@ -1062,10 +1106,8 @@ Status SunriseLinkTransport::uninstall() {
         }
         relocate_map_.clear();
 
-        if (ptml_handle_) {
-            dlclose(ptml_handle_);
-            ptml_handle_ = nullptr;
-        }
+        ptml_handle_ = nullptr;
+        runtime_lib_handle_ = nullptr;
 
         metadata_.reset();
         installed_ = false;

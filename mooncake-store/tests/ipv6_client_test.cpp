@@ -25,7 +25,7 @@
 #include "test_server_helpers.h"
 #include "common.h"
 
-DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp|sunrise_link");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 DEFINE_string(server_address, "[::1]:17813",
               "Transfer engine endpoint in host:port form, IPv6 needs []");

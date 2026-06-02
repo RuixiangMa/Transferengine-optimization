@@ -176,12 +176,17 @@ class DummyClient : public PyClient {
     ErrorCode connect(const std::string &server_address);
 
     int register_ascend_shm(const ShmHelper::ShmSegment *shm,
-                            bool is_local = false);
+                             bool is_local = false);
+
+#if defined(USE_SUNRISE)
+    int register_sunrise_shm(const ShmHelper::ShmSegment *shm,
+                             bool is_local = false);
+#endif
 
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
 
-#if defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND_DIRECT) || defined(USE_SUNRISE)
     int register_device_buffer_for_reconnect(void *buffer, size_t size);
 
     int unregister_device_buffer_for_reconnect(void *buffer);
@@ -287,7 +292,7 @@ class DummyClient : public PyClient {
     void ping_thread_main();
     std::atomic<bool> connected_{false};
 
-#if defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND_DIRECT) || defined(USE_SUNRISE)
     mutable std::mutex registered_device_buffers_mutex_;
     std::unordered_map<uint64_t, size_t> registered_device_buffers_;
 #endif

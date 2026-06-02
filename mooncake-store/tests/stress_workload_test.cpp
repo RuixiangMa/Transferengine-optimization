@@ -17,7 +17,7 @@
 #include "utils.h"
 
 // Configuration flags
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|sunrise_link");
 DEFINE_string(device_name, "erdma_0",
               "Device name to use, valid if protocol=rdma");
 DEFINE_string(master_address, "localhost:50051", "Address of master server");

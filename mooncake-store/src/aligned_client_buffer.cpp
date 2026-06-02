@@ -14,7 +14,8 @@ constexpr std::string_view kAscendProtocol = "ascend";
 constexpr std::string_view kUbshmemProtocol = "ubshmem";
 
 bool UseProtocolAllocator(const std::string& protocol) {
-    return protocol == kAscendProtocol || protocol == kUbshmemProtocol;
+    return protocol == kAscendProtocol || protocol == kUbshmemProtocol ||
+           protocol == "sunrise_link";
 }
 
 void FreeAlignedBuffer(void* buffer, size_t size, const std::string& protocol,

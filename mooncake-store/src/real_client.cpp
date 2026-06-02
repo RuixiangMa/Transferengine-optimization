@@ -40,6 +40,9 @@
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #endif
+#if defined(USE_SUNRISE)
+#include <tang_runtime_api.h>
+#endif
 
 DEFINE_bool(enable_http_server, false,
             "Enable embedded HTTP server for health check and metrics.");
@@ -625,6 +628,28 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+#if defined(USE_SUNRISE)
+tl::expected<void, ErrorCode> RealClient::setup_sunrise_internal(
+    size_t local_buffer_size) {
+    int device_count = 0;
+    tangError_t ret = tangGetDeviceCount(&device_count);
+    if (ret != tangSuccess || device_count <= 0) {
+        LOG(ERROR) << "tangGetDeviceCount failed or no devices found, ret="
+                   << ret << " count=" << device_count;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    ret = tangSetDevice(0);
+    if (ret != tangSuccess) {
+        LOG(ERROR) << "tangSetDevice(0) failed: " << ret << " "
+                   << tangGetErrorString(ret);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    LOG(INFO) << "Sunrise runtime initialized with " << device_count
+              << " device(s)";
+    return {};
+}
+#endif
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -646,6 +671,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "Failed to set current context for device " << 0;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+    }
+#endif
+
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link" && globalConfig().sunrise_agent_mode) {
+        auto sunrise_setup = setup_sunrise_internal(local_buffer_size);
+        if (!sunrise_setup) return sunrise_setup;
     }
 #endif
 
@@ -850,6 +882,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
+            } else if (this->protocol == "sunrise_link") {
+                sunrise_segment_ptrs_.emplace_back(ptr, SunriseSegmentDeleter{});
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
@@ -1027,10 +1061,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate protocol is supported
-    if (protocol != "tcp" && protocol != "rdma") {
+    // Keep config-dict setup aligned with setup_real() protocol handling.
+    if (protocol != "tcp" && protocol != "rdma" &&
+        protocol != "sunrise_link") {
         LOG(ERROR) << "Invalid " << CONFIG_KEY_PROTOCOL << ": " << protocol
-                   << ", must be 'tcp' or 'rdma'";
+                   << ", must be 'tcp', 'rdma' or 'sunrise_link'";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -1105,6 +1140,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
+    sunrise_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
@@ -1120,7 +1156,11 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
             if (seg.shm_buffer == nullptr) {
                 continue;
             }
-            if (seg.is_ascend) {
+            if (seg.is_sunrise) {
+#if defined(USE_SUNRISE)
+                teardown_sunrise_shm_buffer(seg);
+#endif
+            } else if (seg.is_ascend) {
                 teardown_ascend_shm_buffer(seg);
             } else if (munmap(seg.shm_buffer, seg.shm_size) != 0) {
                 LOG(ERROR) << "Failed to unmap shm: " << seg.shm_name
@@ -2370,6 +2410,127 @@ void RealClient::teardown_ascend_shm_buffer(MappedShm &shm) {
 #endif
 }
 
+#if defined(USE_SUNRISE)
+tl::expected<void, ErrorCode> RealClient::sunrise_shm_internal(
+    uint64_t dummy_base_addr, size_t mem_size, bool is_local_buffer,
+    const std::string &ipc_handle_bytes, int32_t device_id,
+    const UUID &client_id) {
+    if (ipc_handle_bytes.size() != sizeof(tangIpcMemHandle_t)) {
+        LOG(ERROR) << "Invalid Sunrise IPC handle size: "
+                   << ipc_handle_bytes.size()
+                   << " expected: " << sizeof(tangIpcMemHandle_t);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    tangIpcMemHandle_t handle;
+    memcpy(&handle, ipc_handle_bytes.data(), sizeof(handle));
+
+    int saved_dev = -1;
+    tangGetDevice(&saved_dev);
+    tangError_t ret = tangSetDevice(device_id);
+    if (ret != tangSuccess) {
+        LOG(ERROR) << "tangSetDevice(" << device_id
+                   << ") failed in sunrise_shm_internal: " << ret;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    void *opened_ptr = nullptr;
+    ret = tangIpcOpenMemHandle(&opened_ptr, handle,
+                               tangIpcMemLazyEnablePeerAccess);
+    if (saved_dev >= 0) tangSetDevice(saved_dev);
+    if (ret != tangSuccess || !opened_ptr) {
+        LOG(ERROR) << "tangIpcOpenMemHandle failed: " << ret << " "
+                   << tangGetErrorString(ret);
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::string location = "cuda:" + std::to_string(device_id);
+    if (is_local_buffer) {
+        auto reg_result = client_->RegisterLocalMemory(opened_ptr, mem_size,
+                                                       location, false, true);
+        if (!reg_result) {
+            LOG(ERROR) << "RegisterLocalMemory failed for Sunrise shm";
+            tangIpcCloseMemHandle(opened_ptr);
+            return tl::unexpected(reg_result.error());
+        }
+    }
+
+    MappedShm shm;
+    shm.shm_name = "sunrise_ipc_" + std::to_string(dummy_base_addr);
+    // shm_addr_offset must be opened_ptr - dummy_base_addr (matching Ascend
+    // pattern), not 0 as originally planned.  The offset translates dummy
+    // addresses used by the master into real mapped addresses at line 357.
+    shm.shm_addr_offset = reinterpret_cast<uintptr_t>(opened_ptr) -
+                          static_cast<uintptr_t>(dummy_base_addr);
+    shm.shm_buffer = opened_ptr;
+    shm.shm_size = mem_size;
+    shm.dummy_base_addr = dummy_base_addr;
+    shm.is_sunrise = true;
+    shm.is_ipc = true;
+    shm.device_id = device_id;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        auto &ctx = shm_contexts_[client_id];
+        if (is_local_buffer) {
+            if (ctx.client_buffer_allocator) {
+                tangIpcCloseMemHandle(opened_ptr);
+                return tl::unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            }
+            ctx.client_buffer_allocator =
+                ClientBufferAllocator::create(opened_ptr, mem_size, this->protocol);
+        }
+        ctx.mapped_shms.push_back(std::move(shm));
+    }
+
+    LOG(INFO) << "Sunrise shm registered: dev=" << device_id
+              << " size=" << mem_size
+              << " ptr=" << opened_ptr;
+    return {};
+}
+
+void RealClient::teardown_sunrise_shm_buffer(MappedShm &shm) {
+    if (shm.shm_size > 0 && client_) {
+        auto res = client_->unregisterLocalMemory(shm.shm_buffer, true);
+        if (!res) {
+            LOG(WARNING) << "Failed to unregister Sunrise local memory: "
+                         << shm.shm_name
+                         << ", error: " << toString(res.error());
+        }
+    }
+    if (shm.shm_buffer) {
+        tangError_t ret = tangIpcCloseMemHandle(shm.shm_buffer);
+        if (ret != tangSuccess) {
+            LOG(WARNING) << "tangIpcCloseMemHandle failed: " << ret;
+        }
+        shm.shm_buffer = nullptr;
+    }
+    LOG(INFO) << "Sunrise shm torn down: " << shm.shm_name;
+}
+
+tl::expected<void, ErrorCode> RealClient::sunrise_unmap_shm_internal(
+    const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) return {};
+
+    auto &mapped_shms = it->second.mapped_shms;
+    for (auto shm_it = mapped_shms.begin(); shm_it != mapped_shms.end();) {
+        if (shm_it->is_sunrise) {
+            teardown_sunrise_shm_buffer(*shm_it);
+            shm_it = mapped_shms.erase(shm_it);
+        } else {
+            ++shm_it;
+        }
+    }
+    it->second.client_buffer_allocator.reset();
+    if (mapped_shms.empty()) {
+        shm_contexts_.erase(it);
+    }
+    return {};
+}
+#endif
+
 tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     const UUID &client_id) {
     LOG(INFO) << "[ascend_unmap_shm] client_id=" << client_id
@@ -2477,7 +2638,11 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 
     // Unmap and clean up the shm
     if (shm_it->shm_buffer) {
-        if (shm_it->is_ascend) {
+        if (shm_it->is_sunrise) {
+#if defined(USE_SUNRISE)
+            teardown_sunrise_shm_buffer(*shm_it);
+#endif
+        } else if (shm_it->is_ascend) {
             teardown_ascend_shm_buffer(*shm_it);
         } else {
 #ifdef USE_ASCEND_DIRECT
@@ -3020,7 +3185,18 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto result = client_->RegisterLocalMemory(buffer, size, kWildcardLocation,
+
+    std::string location = kWildcardLocation;
+#if defined(USE_SUNRISE)
+    {
+        int device_id = -1;
+        if (gpu_staging::IsDevicePointer(buffer, &device_id)) {
+            location = "cuda:" + std::to_string(device_id);
+        }
+    }
+#endif
+
+    auto result = client_->RegisterLocalMemory(buffer, size, location,
                                                false, true);
     if (!result) {
         return result;

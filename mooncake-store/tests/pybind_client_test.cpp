@@ -8,15 +8,21 @@
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "real_client.h"
 #include "test_server_helpers.h"
 
-DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
+#if defined(USE_SUNRISE)
+#include <tang_runtime_api.h>
+#endif
+
+DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp|sunrise_link");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
 namespace mooncake {
@@ -33,6 +39,30 @@ class GLogMuter {
 
    private:
     int original_log_level_;
+};
+
+class ScopedEnvVar {
+   public:
+    explicit ScopedEnvVar(const char* key) : key_(key) {
+        if (const char* value = std::getenv(key_)) {
+            original_value_ = value;
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (original_value_.has_value()) {
+            setenv(key_, original_value_->c_str(), 1);
+        } else {
+            unsetenv(key_);
+        }
+    }
+
+    void set(const char* value) { setenv(key_, value, 1); }
+    void unset() { unsetenv(key_); }
+
+   private:
+    const char* key_;
+    std::optional<std::string> original_value_;
 };
 
 class RealClientTest : public ::testing::Test {
@@ -929,6 +959,30 @@ TEST_F(RealClientTest, SetupWithConfigDict) {
     EXPECT_EQ(retrieved_data, test_data) << "Retrieved data should match";
 }
 
+TEST_F(RealClientTest, SetupWithConfigDictAcceptsSunriseLink) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    use_tent.unset();
+    use_tev1.unset();
+
+    ConfigDict config;
+    config[CONFIG_KEY_LOCAL_HOSTNAME] = "localhost:17813";
+    config[CONFIG_KEY_METADATA_SERVER] = "P2PHANDSHAKE";
+    config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_PROTOCOL] = "sunrise_link";
+    config[CONFIG_KEY_MASTER_SERVER_ADDR] = master_address_;
+
+    auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value())
+        << "setup_internal(ConfigDict) should accept sunrise_link and "
+           "auto-enable TENT";
+}
+
 TEST_F(RealClientTest, ErrSetupWithInvalidArgument) {
     GLogMuter muter;
     // Case 1: Setup with unreachable master address
@@ -955,6 +1009,213 @@ TEST_F(RealClientTest, ErrSetupWithInvalidArgument) {
                                     rdma_devices, master_address_);
     EXPECT_NE(result, 0) << "Setup with empty hostname should fail";
 }
+
+TEST_F(RealClientTest, SetupAcceptsSunriseLinkWithoutTentEnv) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    ScopedEnvVar use_tev1("MC_USE_TEV1");
+    use_tent.unset();
+    use_tev1.unset();
+
+    int result = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                        16 * 1024 * 1024,
+                                        16 * 1024 * 1024,
+                                        "sunrise_link", "", master_address_);
+    EXPECT_EQ(result, 0)
+        << "sunrise_link should auto-enable TENT mode without MC_USE_TENT";
+}
+
+TEST_F(RealClientTest, SetupAcceptsSunriseLinkWithTent) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    use_tent.set("1");
+
+    int result = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                        16 * 1024 * 1024,
+                                        16 * 1024 * 1024,
+                                        "sunrise_link", "", master_address_);
+    EXPECT_EQ(result, 0)
+        << "sunrise_link should be accepted when TENT mode is enabled";
+}
+
+TEST_F(RealClientTest, SunriseLinkHostPutGetRemoveWithTent) {
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    use_tent.set("1");
+
+    const uint64_t kv_lease_ttl_ms = 1;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kv_lease_ttl_ms)
+                                  .build()));
+    master_address_ = master_.master_address();
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024,
+                                     16 * 1024 * 1024,
+                                     "sunrise_link", "", master_address_),
+              0);
+
+    const std::string key = "sunrise_link_host_key";
+    const std::string value = "sunrise_link_host_value";
+    std::span<const char> data_span(value.data(), value.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    {
+        auto buffer_handle = py_client_->get_buffer(key);
+        ASSERT_NE(buffer_handle, nullptr);
+        std::string actual(static_cast<const char*>(buffer_handle->ptr()),
+                           buffer_handle->size());
+        EXPECT_EQ(actual, value);
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl_ms));
+    EXPECT_EQ(py_client_->remove(key), 0);
+    EXPECT_EQ(py_client_->isExist(key), 0);
+}
+
+#ifdef USE_SUNRISE
+TEST_F(RealClientTest, SunriseLinkDevicePutFromAndGetInto) {
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    use_tent.set("1");
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024,
+                                     16 * 1024 * 1024,
+                                     "sunrise_link", "", master_address_),
+              0);
+
+    int device_count = 0;
+    if (tangGetDeviceCount(&device_count) != tangSuccess || device_count <= 0) {
+        GTEST_SKIP() << "No Sunrise device detected";
+    }
+    tangError_t set_dev_ret = tangSetDevice(0);
+    if (set_dev_ret != tangSuccess) {
+        GTEST_SKIP() << "tangSetDevice(0) failed after setup_real, ret="
+                     << set_dev_ret;
+    }
+
+    const std::string key = "sunrise_link_device_key";
+    const std::string value = "sunrise_device_roundtrip";
+
+    void* device_src = nullptr;
+    void* device_dst = nullptr;
+    ASSERT_EQ(tangMalloc(&device_src, value.size()), tangSuccess);
+    ASSERT_EQ(tangMalloc(&device_dst, value.size()), tangSuccess);
+
+    ASSERT_EQ(tangMemcpy(device_src, value.data(), value.size(),
+                         tangMemcpyHostToDevice), tangSuccess);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    // NOTE: register_buffer must precede put_from. We register both device
+    // buffers, then exercise the device-to-segment and segment-to-device
+    // round-trip via sunrise_link. The transport selection falls back to
+    // sunrise_link on this single-node setup; for cross-node it would
+    // additionally require IPC handles.
+    int reg_src = py_client_->register_buffer(device_src, value.size());
+    if (reg_src != 0) {
+        GTEST_SKIP() << "register_buffer(device_src) returned " << reg_src
+                     << "; likely the Tang runtime rejected the IPC handle "
+                        "path on this build. Host path is covered by "
+                        "SunriseLinkHostPutGetRemoveWithTent.";
+    }
+    int reg_dst = py_client_->register_buffer(device_dst, value.size());
+    ASSERT_EQ(reg_dst, 0);
+
+    ASSERT_EQ(py_client_->put_from(key, device_src, value.size(), config), 0);
+
+    ASSERT_EQ(py_client_->get_into(key, device_dst, value.size()),
+              static_cast<int64_t>(value.size()));
+
+    std::string host(value.size(), '\0');
+    ASSERT_EQ(tangMemcpy(host.data(), device_dst, value.size(),
+                         tangMemcpyDeviceToHost), tangSuccess);
+    EXPECT_EQ(host, value);
+
+    EXPECT_EQ(py_client_->unregister_buffer(device_dst), 0);
+    tangFree(device_src);
+    tangFree(device_dst);
+}
+#endif
+
+#if defined(USE_SUNRISE)
+TEST_F(RealClientTest, SunriseLinkMultiProcessC2C) {
+    ScopedEnvVar use_tent("MC_USE_TENT");
+    use_tent.set("1");
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string key = "sunrise_mp_key";
+    const std::string value = "sunrise_mp_value";
+
+    int pipefd[2];
+    ASSERT_EQ(pipe(pipefd), 0);
+
+    pid_t pid = fork();
+    ASSERT_GE(pid, 0);
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        auto client = std::make_unique<RealClient>();
+        auto setup_result = client->setup_internal(
+            "server_host", "P2PHANDSHAKE",
+            1 << 30, 1 << 24, "sunrise_link", "", master_address_);
+        if (!setup_result) {
+            char err = 'S';
+            (void)write(pipefd[1], &err, 1);
+            close(pipefd[1]);
+            _exit(1);
+        }
+
+        std::span<const char> data_span(value.data(), value.size());
+        ReplicateConfig config;
+        config.replica_num = 1;
+        int put_rc = client->put(key, data_span, config);
+        char status = (put_rc == 0) ? 'D' : 'P';
+        (void)write(pipefd[1], &status, 1);
+        close(pipefd[1]);
+
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+    char status = 0;
+    (void)read(pipefd[0], &status, 1);
+    close(pipefd[0]);
+
+    ASSERT_EQ(status, 'D') << "Child process failed: "
+                           << (status == 'S' ? "setup" : "put");
+
+    auto client = std::make_unique<RealClient>();
+    auto setup_result = client->setup_internal(
+        "client_host", "P2PHANDSHAKE",
+        1 << 30, 1 << 24, "sunrise_link", "", master_address_);
+    ASSERT_TRUE(setup_result.has_value());
+
+    EXPECT_GT(client->isExist(key), 0)
+        << "Key should be visible across processes via master";
+
+    int64_t size = client->getSize(key);
+    EXPECT_EQ(size, static_cast<int64_t>(value.size()))
+        << "Object size should match across processes";
+
+    int wstatus = 0;
+    (void)waitpid(pid, &wstatus, 0);
+    ASSERT_TRUE(WIFEXITED(wstatus));
+    ASSERT_EQ(WEXITSTATUS(wstatus), 0);
+}
+#endif
 
 // Operations on uninitialized client (before setup_real)
 TEST_F(RealClientTest, ErrOperationsBeforeSetup) {

@@ -316,8 +316,8 @@ bool TransportSelector::isTransportAvailable(
     }
 
     // Special constraints
-    if ((type == NVLINK || type == SHM) && !context.same_machine) {
-        return false;  // NVLINK and SHM only work on same machine
+    if ((type == NVLINK || type == SHM || type == SUNRISE_LINK) && !context.same_machine) {
+        return false;
     }
 
     const auto& caps = transport->capabilities();

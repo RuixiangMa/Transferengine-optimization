@@ -6,11 +6,41 @@
 #include <acl/acl_rt.h>
 #endif
 
+#if defined(USE_SUNRISE)
+#include <tang_runtime_api.h>
+#include <sys/mman.h>
+#include <cerrno>
+#endif
+
 #include <cstddef>
 #include <glog/logging.h>
 
 namespace mooncake {
 namespace gpu_staging {
+
+#if defined(USE_SUNRISE)
+inline tangError_t QueryPointerAttrsBestEffort(const void* ptr,
+                                               tangPointerAttributes* attr,
+                                               int preferred_dev = -1) {
+    if (!ptr || !attr) return tangErrorInvalidValue;
+    if (preferred_dev < 0) {
+        attr->type = tangMemoryTypeUnregistered;
+        return tangErrorInvalidValue;
+    }
+    int saved_device = -1;
+    if (tangGetDevice(&saved_device) != tangSuccess) {
+        saved_device = -1;
+    }
+    tangError_t ret = tangSetDevice(preferred_dev);
+    if (ret != tangSuccess) {
+        if (saved_device >= 0) tangSetDevice(saved_device);
+        return ret;
+    }
+    ret = tangPointerGetAttributes(attr, const_cast<void*>(ptr));
+    if (saved_device >= 0) tangSetDevice(saved_device);
+    return ret;
+}
+#endif
 
 // Detect whether ptr resides in accelerator device memory.
 // If so, writes the device ID to *out_device_id for subsequent SetDevice.
@@ -38,6 +68,25 @@ inline bool IsDevicePointer(const void* ptr, int* out_device_id) {
         if (out_device_id) *out_device_id = static_cast<int>(attr.location.id);
         return true;
     }
+#elif defined(USE_SUNRISE)
+    {
+        tangPointerAttributes attr = {};
+        tangError_t ret = QueryPointerAttrsBestEffort(ptr, &attr, 0);
+        if (ret == tangSuccess && attr.type == tangMemoryTypeDevice) {
+            if (out_device_id) *out_device_id = attr.device;
+            return true;
+        }
+#ifdef MADV_POPULATE_WRITE
+        uintptr_t page = reinterpret_cast<uintptr_t>(ptr) & ~4095ULL;
+        errno = 0;
+        int mr = madvise(reinterpret_cast<void*>(page), 4096,
+                         MADV_POPULATE_WRITE);
+        if (mr != 0 && errno == ENOMEM) {
+            if (out_device_id) *out_device_id = 0;
+            return true;
+        }
+#endif
+    }
 #endif
     (void)ptr;
     (void)out_device_id;
@@ -54,6 +103,8 @@ inline bool CopyDeviceToHost(void* dst, const void* src, size_t size) {
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     return aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_DEVICE_TO_HOST) ==
            ACL_SUCCESS;
+#elif defined(USE_SUNRISE)
+    return tangMemcpy(dst, src, size, tangMemcpyDeviceToHost) == tangSuccess;
 #else
     (void)dst;
     (void)src;
@@ -86,6 +137,48 @@ inline bool CopyAuto(void* dst, const void* src, size_t size) {
     else if (dst_dev)
         kind = ACL_MEMCPY_HOST_TO_DEVICE;
     return aclrtMemcpy(dst, size, src, size, kind) == ACL_SUCCESS;
+#elif defined(USE_SUNRISE)
+    tangPointerAttributes src_attr = {}, dst_attr = {};
+    tangError_t src_ret = QueryPointerAttrsBestEffort(
+        const_cast<void*>(src), &src_attr, 0);
+    tangError_t dst_ret = QueryPointerAttrsBestEffort(dst, &dst_attr, 0);
+    bool src_dev = (src_ret == tangSuccess &&
+                    src_attr.type == tangMemoryTypeDevice);
+    bool dst_dev = (dst_ret == tangSuccess &&
+                    dst_attr.type == tangMemoryTypeDevice);
+    if (src_ret != tangSuccess || dst_ret != tangSuccess) {
+#ifdef MADV_POPULATE_WRITE
+        if (!src_dev) {
+            uintptr_t src_page = reinterpret_cast<uintptr_t>(src) & ~4095ULL;
+            errno = 0;
+            src_dev = madvise(reinterpret_cast<void*>(src_page), 4096,
+                              MADV_POPULATE_WRITE) != 0 &&
+                     errno == ENOMEM;
+        }
+        if (!dst_dev) {
+            uintptr_t dst_page = reinterpret_cast<uintptr_t>(dst) & ~4095ULL;
+            errno = 0;
+            dst_dev = madvise(reinterpret_cast<void*>(dst_page), 4096,
+                              MADV_POPULATE_WRITE) != 0 &&
+                     errno == ENOMEM;
+        }
+#else
+        (void)src_dev;
+        (void)dst_dev;
+#endif
+    }
+    if (!src_dev && !dst_dev) {
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    tangMemcpyKind kind = tangMemcpyHostToHost;
+    if (src_dev && dst_dev)
+        kind = tangMemcpyDeviceToDevice;
+    else if (src_dev)
+        kind = tangMemcpyDeviceToHost;
+    else if (dst_dev)
+        kind = tangMemcpyHostToDevice;
+    return tangMemcpy(dst, src, size, kind) == tangSuccess;
 #else
     (void)dst;
     (void)src;
@@ -104,6 +197,8 @@ inline void SetDevice(int device_id) {
     hipSetDevice(device_id);
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     aclrtSetDevice(device_id);
+#elif defined(USE_SUNRISE)
+    tangSetDevice(device_id);
 #endif
 }
 
@@ -117,6 +212,8 @@ inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     return aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_HOST_TO_DEVICE) ==
            ACL_SUCCESS;
+#elif defined(USE_SUNRISE)
+    return tangMemcpy(dst, src, size, tangMemcpyHostToDevice) == tangSuccess;
 #else
     (void)dst;
     (void)src;
@@ -157,6 +254,26 @@ inline bool IsHostPointer(const void* ptr) {
         return true;
     }
     return attr.location.type != ACL_MEM_LOCATION_TYPE_DEVICE;
+#elif defined(USE_SUNRISE)
+    {
+        tangPointerAttributes attr = {};
+        tangError_t ret = QueryPointerAttrsBestEffort(ptr, &attr, 0);
+        if (ret == tangSuccess) {
+            return attr.type != tangMemoryTypeDevice;
+        }
+    }
+#ifdef MADV_POPULATE_WRITE
+    {
+        uintptr_t page = reinterpret_cast<uintptr_t>(ptr) & ~4095ULL;
+        errno = 0;
+        if (madvise(reinterpret_cast<void*>(page), 4096,
+                    MADV_POPULATE_WRITE) != 0 &&
+            errno == ENOMEM) {
+            return false;
+        }
+    }
+#endif
+    return true;
 #else
     (void)ptr;
     return true;  // CPU-only build: all pointers are host

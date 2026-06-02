@@ -349,4 +349,18 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
     target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
     target_link_libraries(mooncake_client PRIVATE ascendcl)
 endif()
+
+if(USE_SUNRISE)
+    target_compile_definitions(mooncake_store PRIVATE USE_SUNRISE)
+    target_compile_definitions(mooncake_client PRIVATE USE_SUNRISE)
+    target_include_directories(mooncake_store PRIVATE /usr/local/tangrt/include)
+    target_include_directories(mooncake_client PRIVATE /usr/local/tangrt/include)
+    target_link_libraries(mooncake_store PRIVATE
+        /usr/local/tangrt/lib/libtangrt_shared.so
+        /usr/local/tangrt/lib/libptml_shared.so dl)
+    target_link_libraries(mooncake_client PRIVATE
+        /usr/local/tangrt/lib/libtangrt_shared.so
+        /usr/local/tangrt/lib/libptml_shared.so dl)
+endif()
+
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

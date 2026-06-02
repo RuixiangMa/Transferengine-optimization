@@ -14,7 +14,8 @@ namespace testing {
 
 // Flags for transfer engine
 #define FLAG_protocol \
-    DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
+    DEFINE_string(protocol, "tcp",
+                  "Transfer protocol: rdma|tcp|sunrise_link");
 #define FLAG_device_name                 \
     DEFINE_string(device_name, "ibp6s0", \
                   "Device name to use, valid if protocol=rdma");

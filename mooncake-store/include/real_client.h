@@ -17,6 +17,9 @@
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/coro_io.hpp>
@@ -776,12 +779,22 @@ class RealClient : public PyClient {
         }
     };
 
+    struct SunriseSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                sunrise_free_memory(ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+    std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
+        sunrise_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -798,6 +811,7 @@ class RealClient : public PyClient {
         size_t shm_size = 0;
         uintptr_t dummy_base_addr = 0;
         bool is_ascend = false;
+        bool is_sunrise = false;
         bool is_ipc = false;
         // Ascend physical device id from dummy (dummy-real RPC).
         int32_t device_id = kInvalidPhysicalDeviceId;
@@ -887,8 +901,23 @@ class RealClient : public PyClient {
     void handle_ipc_shm_fd_request(int client_sock);
 
     void teardown_ascend_shm_buffer(MappedShm &shm);
+#if defined(USE_SUNRISE)
+    tl::expected<void, ErrorCode> sunrise_shm_internal(
+        uint64_t dummy_base_addr, size_t mem_size, bool is_local_buffer,
+        const std::string &ipc_handle_bytes, int32_t device_id,
+        const UUID &client_id);
+
+    tl::expected<void, ErrorCode> sunrise_unmap_shm_internal(
+        const UUID &client_id);
+
+    void teardown_sunrise_shm_buffer(MappedShm &shm);
+#endif
     tl::expected<void, ErrorCode> setup_ascend_internal(
         size_t local_buffer_size);
+#if defined(USE_SUNRISE)
+    tl::expected<void, ErrorCode> setup_sunrise_internal(
+        size_t local_buffer_size);
+#endif
 
    private:
     std::unordered_map<std::string, MountedSegmentRecord>

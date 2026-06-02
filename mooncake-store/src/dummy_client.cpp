@@ -22,6 +22,10 @@
 #include "acl/acl_rt.h"
 #include "ascend_allocator.h"
 #endif
+#if defined(USE_SUNRISE)
+#include "tang_runtime_api.h"
+#include "gpu_staging_utils.h"
+#endif
 
 namespace {
 size_t sum_value_sizes(const std::vector<std::span<const char>>& values) {
@@ -131,9 +135,19 @@ constexpr bool can_invoke_when_disconnected() {
            std::is_same_v<Method,
                           std::remove_reference_t<
                               decltype(&RealClient::ascend_shm_internal)>> ||
-           std::is_same_v<Method,
-                          std::remove_reference_t<
-                              decltype(&RealClient::ascend_ipc_shm_internal)>>;
+             std::is_same_v<Method,
+                            std::remove_reference_t<
+                                decltype(&RealClient::ascend_ipc_shm_internal)>>
+#if defined(USE_SUNRISE)
+             || std::is_same_v<Method,
+                            std::remove_reference_t<
+                                decltype(&RealClient::sunrise_shm_internal)>>
+             || std::is_same_v<
+                    Method,
+                    std::remove_reference_t<
+                        decltype(&RealClient::sunrise_unmap_shm_internal)>>
+#endif
+             ;
 }
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
@@ -370,6 +384,55 @@ int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
     return 0;
 }
 
+#if defined(USE_SUNRISE)
+int DummyClient::register_sunrise_shm(const ShmHelper::ShmSegment* shm,
+                                      bool is_local) {
+    uint64_t dummy_base_addr = reinterpret_cast<uint64_t>(shm->base_addr);
+    auto check_result = invoke_rpc<&RealClient::is_shm_mapped_internal, bool>(
+        dummy_base_addr, client_id_);
+    if (check_result && *check_result) {
+        return 0;
+    }
+
+    void* buffer = shm->base_addr;
+    int device_id = -1;
+
+    if (gpu_staging::IsDevicePointer(buffer, &device_id)) {
+        int saved_dev = -1;
+        tangGetDevice(&saved_dev);
+        tangSetDevice(device_id);
+        tangIpcMemHandle_t handle;
+        tangError_t ret = tangIpcGetMemHandle(&handle, buffer);
+        if (saved_dev >= 0) tangSetDevice(saved_dev);
+        if (ret != tangSuccess) {
+            LOG(ERROR) << "tangIpcGetMemHandle failed: " << ret << " "
+                       << tangGetErrorString(ret);
+            return -1;
+        }
+
+        std::string handle_bytes(reinterpret_cast<const char*>(&handle),
+                                 sizeof(handle));
+        auto result =
+            invoke_rpc<&RealClient::sunrise_shm_internal, void>(
+                dummy_base_addr, shm->size, is_local, handle_bytes, device_id,
+                client_id_);
+        if (!result) {
+            LOG(ERROR) << "sunrise_shm_internal RPC failed for device buffer";
+            return -1;
+        }
+        LOG(INFO) << "Registered Sunrise device shm: dev=" << device_id
+                  << " size=" << shm->size;
+        return 0;
+    }
+
+    if (shm->fd < 0) {
+        LOG(ERROR) << "Host POSIX shared memory requires memfd-backed allocation";
+        return -1;
+    }
+    return register_shm_via_ipc(shm, is_local);
+}
+#endif
+
 int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
                                       bool is_local) {
     if (shm->fd < 0) {
@@ -484,6 +547,10 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
               << " physical_dev=" << device_id_;
 #endif
 
+#if defined(USE_SUNRISE)
+    globalConfig().sunrise_agent_mode = true;
+#endif
+
     ipc_socket_path_ = ipc_socket_path;
     shm_helper_ = ShmHelper::getInstance();
     if (local_buffer_size > 0) {
@@ -508,7 +575,17 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                 shm_helper_->free(local_buffer_shm->base_addr);
                 return -1;
             }
-        } else {
+        }
+#if defined(USE_SUNRISE)
+        else if (globalConfig().sunrise_agent_mode) {
+            if (register_sunrise_shm(local_buffer_shm.get(), true) != 0) {
+                LOG(ERROR) << "Failed to register Sunrise SHM via IPC";
+                shm_helper_->free(local_buffer_shm->base_addr);
+                return -1;
+            }
+        }
+#endif
+        else {
             if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
                 LOG(ERROR) << "Failed to register SHM via IPC";
                 // Register failed, cleanup
@@ -553,7 +630,7 @@ int DummyClient::tearDownAll() {
     }
     connected_.store(false);
     last_ping_healthy_.store(false);
-#if defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND_DIRECT) || defined(USE_SUNRISE)
     {
         std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
         registered_device_buffers_.clear();
@@ -571,13 +648,20 @@ int64_t DummyClient::unregister_shm() {
                 client_id_));
     }
 #endif
+#if defined(USE_SUNRISE)
+    if (globalConfig().sunrise_agent_mode) {
+        return to_py_ret(
+            invoke_rpc<&RealClient::sunrise_unmap_shm_internal, void>(
+                client_id_));
+    }
+#endif
     return to_py_ret(
         invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_));
 }
 
-#if defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND_DIRECT) || defined(USE_SUNRISE)
 int DummyClient::register_device_buffer_for_reconnect(void* buffer,
-                                                      size_t size) {
+                                                       size_t size) {
     const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
     {
         std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
@@ -593,6 +677,15 @@ int DummyClient::register_device_buffer_for_reconnect(void* buffer,
     ShmHelper::ShmSegment shm{};
     shm.base_addr = buffer;
     shm.size = size;
+#if defined(USE_SUNRISE)
+    if (globalConfig().sunrise_agent_mode) {
+        if (register_sunrise_shm(&shm, false) != 0) {
+            LOG(ERROR) << "Failed to register Sunrise device buffer, buffer="
+                       << buffer << ", size=" << size;
+            return -1;
+        }
+    } else
+#endif
     if (register_ascend_shm(&shm, false) != 0) {
         LOG(ERROR) << "Failed to register device buffer, buffer=" << buffer
                    << ", size=" << size;
@@ -672,6 +765,14 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         // non-Fabric Host: same rules as shm
     }
 #endif
+#if defined(USE_SUNRISE)
+    if (globalConfig().sunrise_agent_mode) {
+        int device_id = -1;
+        if (gpu_staging::IsDevicePointer(buffer, &device_id)) {
+            return register_device_buffer_for_reconnect(buffer, size);
+        }
+    }
+#endif
     // Find which shm this buffer belongs to
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) {
@@ -716,6 +817,14 @@ int DummyClient::unregister_buffer(void* buffer) {
         auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
         if (acl_ret == ACL_ERROR_NONE &&
             attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            return unregister_device_buffer_for_reconnect(buffer);
+        }
+    }
+#endif
+#if defined(USE_SUNRISE)
+    if (globalConfig().sunrise_agent_mode) {
+        int device_id = -1;
+        if (gpu_staging::IsDevicePointer(buffer, &device_id)) {
             return unregister_device_buffer_for_reconnect(buffer);
         }
     }
@@ -1281,7 +1390,20 @@ void DummyClient::ping_thread_main() {
                                 all_registered = false;
                                 break;
                             }
-                        } else if (register_shm_via_ipc(
+                        }
+#if defined(USE_SUNRISE)
+                        else if (globalConfig().sunrise_agent_mode) {
+                            if (register_sunrise_shm(shm_ptr.get(),
+                                                     shm_ptr->is_local) != 0) {
+                                LOG(WARNING)
+                                    << "Failed to re-register Sunrise shared "
+                                       "memory during reconnection";
+                                all_registered = false;
+                                break;
+                            }
+                        }
+#endif
+                        else if (register_shm_via_ipc(
                                        shm_ptr.get(), shm_ptr->is_local) != 0) {
                             LOG(WARNING)
                                 << "Failed to re-register shared memory "
@@ -1299,6 +1421,22 @@ void DummyClient::ping_thread_main() {
                         if (register_ascend_shm(&device_buffer, false) != 0) {
                             LOG(WARNING)
                                 << "Failed to re-register device buffer "
+                                   "during reconnection, buffer="
+                                << device_buffer.base_addr
+                                << ", size=" << device_buffer.size;
+                            all_registered = false;
+                            break;
+                        }
+                    }
+                }
+#endif
+#if defined(USE_SUNRISE)
+                if (all_registered && globalConfig().sunrise_agent_mode) {
+                    auto device_buffers = get_registered_device_buffers();
+                    for (const auto& device_buffer : device_buffers) {
+                        if (register_sunrise_shm(&device_buffer, false) != 0) {
+                            LOG(WARNING)
+                                << "Failed to re-register Sunrise device buffer "
                                    "during reconnection, buffer="
                                 << device_buffer.base_addr
                                 << ", size=" << device_buffer.size;

@@ -45,7 +45,7 @@ class ClientTestWrapper {
      *
      * @param hostname The hostname of the client.
      * @param metadata_connstring Transfer engine metadata server url.
-     * @param protocol Transfer protocol: rdma|tcp.
+     * @param protocol Transfer protocol: rdma|tcp|sunrise_link.
      * @param device_name The device name (used in transfer engine).
      * @param master_server_entry The master server entry.
      * @param local_buffer_size The local buffer size that will be used for get

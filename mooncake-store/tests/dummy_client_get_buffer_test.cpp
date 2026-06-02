@@ -19,7 +19,7 @@
 #include "default_config.h"
 #include "test_server_helpers.h"
 
-DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp|sunrise_link");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
 namespace mooncake {

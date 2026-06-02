@@ -20,8 +20,10 @@
 #include <infiniband/verbs.h>
 #include <limits.h>
 #include <numa.h>
-#include <stdlib.h>
+#include <cerrno>
+#include <cstdlib>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -217,53 +219,21 @@ Status SunrisePlatform::probe(std::vector<Topology::NicEntry>& nic_list,
 }
 
 MemoryType SunrisePlatform::getMemoryType(void* addr) {
-    tangPointerAttributes attributes{};
-    tangError_t ret = tangPointerGetAttributes(&attributes, addr);
-    if (ret != tangSuccess) {
-        int saved_dev = 0;
-        if (tangGetDevice(&saved_dev) != tangSuccess) saved_dev = -1;
-        int device_count = 0;
-        if (tangGetDeviceCount(&device_count) == tangSuccess &&
-            device_count > 0) {
-            for (int d = 0; d < device_count; ++d) {
-                if (tangSetDevice(d) != tangSuccess) continue;
-                ret = tangPointerGetAttributes(&attributes, addr);
-                if (ret == tangSuccess) break;
-            }
-            if (saved_dev >= 0) tangSetDevice(saved_dev);
-        }
+    if (!addr) return MTYPE_CPU;
+#ifdef MADV_POPULATE_WRITE
+    uintptr_t page = reinterpret_cast<uintptr_t>(addr) & ~4095ULL;
+    errno = 0;
+    if (madvise(reinterpret_cast<void*>(page), 4096,
+                MADV_POPULATE_WRITE) != 0 && errno == ENOMEM) {
+        return MTYPE_CUDA;
     }
-    if (ret != tangSuccess) return MTYPE_CPU;
-    if (attributes.type == tangMemoryTypeDevice) return MTYPE_CUDA;
+#endif
     return MTYPE_CPU;
 }
 
 const std::vector<RangeLocation> SunrisePlatform::getLocation(
     void* start, size_t len, bool skip_prefault) {
     std::vector<RangeLocation> entries;
-
-    tangPointerAttributes attributes{};
-    tangError_t ret = tangPointerGetAttributes(&attributes, start);
-    if (ret != tangSuccess) {
-        int saved_dev = 0;
-        if (tangGetDevice(&saved_dev) != tangSuccess) saved_dev = -1;
-        int device_count = 0;
-        if (tangGetDeviceCount(&device_count) == tangSuccess &&
-            device_count > 0) {
-            for (int d = 0; d < device_count; ++d) {
-                if (tangSetDevice(d) != tangSuccess) continue;
-                ret = tangPointerGetAttributes(&attributes, start);
-                if (ret == tangSuccess) break;
-            }
-            if (saved_dev >= 0) tangSetDevice(saved_dev);
-        }
-    }
-
-    if (ret == tangSuccess && attributes.type == tangMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genCudaNodeName(attributes.device)});
-        return entries;
-    }
 
     const static size_t kPageSize = 4096;
     uintptr_t aligned_start = alignPage((uintptr_t)start);
@@ -276,7 +246,16 @@ const std::vector<RangeLocation> SunrisePlatform::getLocation(
     }
 
     if (!skip_prefault) {
-        prefaultBeforeProbe(pages.data(), n, aligned_start, "SunrisePlatform");
+#ifdef MADV_POPULATE_WRITE
+        errno = 0;
+        if (madvise(reinterpret_cast<void*>(aligned_start),
+                    static_cast<size_t>(n) * kPageSize,
+                    MADV_POPULATE_WRITE) != 0 &&
+            errno == ENOMEM) {
+            entries.push_back({(uint64_t)start, len, kWildcardLocation});
+            return entries;
+        }
+#endif
     }
 
     int rc = numa_move_pages(0, n, pages.data(), nullptr, status.data(), 0);
@@ -286,10 +265,24 @@ const std::vector<RangeLocation> SunrisePlatform::getLocation(
     }
 
     int node = status[0];
+    if (node < 0) {
+        entries.push_back({(uint64_t)start, len, kWildcardLocation});
+        return entries;
+    }
+
     uint64_t start_addr = (uint64_t)start;
     uint64_t new_start_addr;
     for (int i = 1; i < n; i++) {
         if (status[i] != node) {
+            if (status[i] < 0) {
+                new_start_addr = alignPage((uint64_t)start) + i * kPageSize;
+                entries.push_back({start_addr,
+                                   size_t(new_start_addr - start_addr),
+                                   genCpuNodeName(node)});
+                start_addr = new_start_addr;
+                node = -1;
+                continue;
+            }
             new_start_addr = alignPage((uint64_t)start) + i * kPageSize;
             entries.push_back({start_addr, size_t(new_start_addr - start_addr),
                                genCpuNodeName(node)});

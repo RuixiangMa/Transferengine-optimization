@@ -40,6 +40,7 @@ struct Capabilities {
     bool gpu_to_gpu = false;
     bool dram_to_file = false;
     bool gpu_to_file = false;
+    bool same_machine_only = false;
 };
 
 class Transport {

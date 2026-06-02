@@ -49,6 +49,8 @@ Status SunrisePlatform::allocate(void** pptr, size_t size,
 }
 
 Status SunrisePlatform::free(void* ptr, size_t size) {
+    // Probe Tang at most once; if ptr is unknown to Tang, treat as host
+    // memory. See SunrisePlatform::getMemoryType for the runtime caveat.
     tangPointerAttributes attributes{};
     tangError_t ret = tangPointerGetAttributes(&attributes, ptr);
     if (ret == tangSuccess && attributes.type == tangMemoryTypeDevice) {
@@ -81,6 +83,14 @@ Status SunrisePlatform::copy(void* dst, void* src, size_t length) {
     } else if (sa.type != tangMemoryTypeDevice &&
                da.type == tangMemoryTypeDevice) {
         kind = tangMemcpyHostToDevice;
+    }
+    // When both endpoints are unrecognized by Tang, a tangMemcpy call
+    // would fail (and could also poison the runtime). Fall back to memcpy
+    // to preserve the contract for plain host memory.
+    if (sa.type == tangMemoryTypeUnregistered &&
+        da.type == tangMemoryTypeUnregistered) {
+        memcpy(dst, src, length);
+        return Status::OK();
     }
     tangError_t ret = tangMemcpy(dst, src, length, kind);
     if (ret != tangSuccess)

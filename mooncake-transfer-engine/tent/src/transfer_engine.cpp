@@ -62,6 +62,8 @@ Status TransferEngine::importRemoteSegment(SegmentID& handle,
 
 Status TransferEngine::openSegment(SegmentID& handle,
                                    const std::string& segment_name) {
+    LOG(INFO) << "TENT openSegment: segment_name='" << segment_name
+              << "' local_segment_name='" << impl_->getSegmentName() << "'";
     return impl_->openSegment(handle, segment_name);
 }
 

@@ -4,6 +4,6 @@ if(USE_SUNRISE)
   target_include_directories(platform_sunrise PUBLIC /usr/local/tangrt/include)
   target_link_libraries(
     platform_sunrise
-    PUBLIC tent_common /usr/local/tangrt/lib/linux-x86_64/libtangrt_shared.so
-           /usr/local/tangrt/lib/linux-x86_64/libptml_shared.so dl)
+    PUBLIC tent_common /usr/local/tangrt/lib/libtangrt_shared.so
+           /usr/local/tangrt/lib/libptml_shared.so dl)
 endif()

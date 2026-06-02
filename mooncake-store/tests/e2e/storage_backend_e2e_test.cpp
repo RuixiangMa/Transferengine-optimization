@@ -30,7 +30,7 @@
 #include "types.h"
 #include "utils.h"
 
-DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp|sunrise_link");
 DEFINE_string(device_name, "ibp6s0",
               "Device name to use, valid if protocol=rdma");
 
