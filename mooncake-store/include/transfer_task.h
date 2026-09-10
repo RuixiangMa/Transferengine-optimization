@@ -20,6 +20,9 @@
 #include "replica.h"
 #include "storage_backend.h"
 #include "client_metric.h"
+#ifdef USE_TENT
+#include "tent/common/types.h"
+#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -219,11 +222,12 @@ class TransferEngineOperationState : public OperationState {
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
         : engine_(engine),
+          tent_engine_(engine.getTentEngine().get()),
           batch_id_(batch_id),
           batch_size_(batch_size),
           start_ts_(getCurrentTimeInMilli()) {}
 
-    ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
+    ~TransferEngineOperationState();
 
     bool is_completed() override;
 
@@ -244,6 +248,7 @@ class TransferEngineOperationState : public OperationState {
     void set_result_internal(ErrorCode error_code);
 
     TransferEngine& engine_;
+    mooncake::tent::TransferEngine* tent_engine_;
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
@@ -555,7 +560,12 @@ class TransferSubmitter {
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
                                          std::vector<Slice>& slices,
                                          TransferRequest::OpCode op_code,
-                                         void* ptr = nullptr, size_t size = 0);
+                                         void* ptr = nullptr, size_t size = 0,
+#ifdef USE_TENT
+                                         mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+                                         int intent = 0);
+#endif
 
     /**
      * @brief Submit a range read: read [src_offset, src_offset+size) from
@@ -563,19 +573,39 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitRangeRead(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        uint64_t src_offset);
+        uint64_t src_offset,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 
     std::optional<TransferFuture> submitRangeWrite(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        uint64_t dst_offset);
+        uint64_t dst_offset,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 
     TransferEngine::ScatterTransferOperation submitScatter(
-        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -583,7 +613,12 @@ class TransferSubmitter {
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batched_slices,
-        OffloadBufferAccess buffer_access);
+        OffloadBufferAccess buffer_access,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 
     [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
 
@@ -601,6 +636,7 @@ class TransferSubmitter {
 
    private:
     TransferEngine& engine_;
+    mooncake::tent::TransferEngine* tent_engine_ = nullptr;
     // Cached at construction: the local transport endpoint never changes for
     // the lifetime of the TransferSubmitter, so we avoid calling
     // engine_.getLocalIpAndPort() (which allocates a string) on every transfer.
@@ -659,15 +695,30 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
-        uint64_t src_offset = 0);
+        uint64_t src_offset = 0,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 
     std::optional<TransferFuture> submitMemoryReadOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, uint64_t src_offset);
+        const std::vector<Slice>& slices, uint64_t src_offset,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 
     std::optional<TransferFuture> submitMemoryWriteOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, uint64_t dst_offset);
+        const std::vector<Slice>& slices, uint64_t dst_offset,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
@@ -680,7 +731,12 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests,
+#ifdef USE_TENT
+        mooncake::tent::IntentType intent = mooncake::tent::IntentType::INTENT_UNSPEC);
+#else
+        int intent = 0);
+#endif
 };
 
 }  // namespace mooncake
